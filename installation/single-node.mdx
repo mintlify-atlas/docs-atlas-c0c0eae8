@@ -1,0 +1,199 @@
+---
+title: 'Single-node Hadoop setup guide'
+description: 'Install and configure Apache Hadoop on a single machine in standalone, pseudo-distributed, or fully-distributed mode, with step-by-step HDFS and YARN setup.'
+---
+
+A single-node Hadoop installation is the fastest way to get a working environment for development, testing, and learning. Hadoop supports three operational modes on a single machine: standalone mode runs entirely in a single JVM with no daemons and is useful for debugging MapReduce jobs; pseudo-distributed mode runs each Hadoop daemon in a separate JVM as if it were a real cluster and is the recommended starting point for most users; and fully-distributed mode spans multiple machines and is covered in the [cluster setup guide](/installation/cluster-setup). This page focuses on pseudo-distributed mode, which gives you a real HDFS filesystem and YARN resource manager on one host.
+
+## Prerequisites
+
+Before you begin, ensure the following are in place:
+
+- **Java 17 JDK** installed and available on `PATH`
+- **SSH** installed, with passwordless login to `localhost` configured
+- A Hadoop binary distribution downloaded and extracted
+
+Verify Java:
+
+```bash
+java -version
+```
+
+Set up passwordless SSH to localhost if you have not already done so:
+
+```bash
+ssh-keygen -t rsa -P '' -f ~/.ssh/id_rsa
+cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+chmod 0600 ~/.ssh/authorized_keys
+ssh localhost
+```
+
+## Operating modes
+
+<CardGroup cols={3}>
+  <Card title="Standalone" icon="cube">
+    All processes run in a single JVM. No daemons are started. Useful for debugging MapReduce logic locally.
+  </Card>
+  <Card title="Pseudo-distributed" icon="server">
+    Each daemon runs in its own JVM on a single host. Provides a real HDFS and YARN environment for development.
+  </Card>
+  <Card title="Fully-distributed" icon="network">
+    Daemons are spread across multiple machines. Suitable for production workloads and performance testing.
+  </Card>
+</CardGroup>
+
+## Setup steps
+
+<Steps>
+  <Step title="Configure JAVA_HOME">
+    Edit `etc/hadoop/hadoop-env.sh` and set the path to your JDK. This file acts as the master configuration for all Hadoop daemons and takes precedence over the system environment.
+
+    ```bash
+    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    ```
+
+    <Tip>
+      On macOS, you can use `$(/usr/libexec/java_home -v 17)` as the value so the path resolves dynamically.
+    </Tip>
+  </Step>
+
+  <Step title="Configure core-site.xml">
+    Set the default filesystem URI. This tells all Hadoop components to use HDFS running on port 9000 of localhost.
+
+    ```xml
+    <!-- etc/hadoop/core-site.xml -->
+    <configuration>
+      <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://localhost:9000</value>
+      </property>
+    </configuration>
+    ```
+  </Step>
+
+  <Step title="Configure hdfs-site.xml">
+    Set the replication factor to 1. In a pseudo-distributed setup there is only one DataNode, so a higher replication factor would cause under-replicated blocks.
+
+    ```xml
+    <!-- etc/hadoop/hdfs-site.xml -->
+    <configuration>
+      <property>
+        <name>dfs.replication</name>
+        <value>1</value>
+      </property>
+    </configuration>
+    ```
+  </Step>
+
+  <Step title="Configure mapred-site.xml">
+    Tell MapReduce to use YARN as its execution framework.
+
+    ```xml
+    <!-- etc/hadoop/mapred-site.xml -->
+    <configuration>
+      <property>
+        <name>mapreduce.framework.name</name>
+        <value>yarn</value>
+      </property>
+      <property>
+        <name>mapreduce.application.classpath</name>
+        <value>$HADOOP_MAPRED_HOME/share/hadoop/mapreduce/*:$HADOOP_MAPRED_HOME/share/hadoop/mapreduce/lib/*</value>
+      </property>
+    </configuration>
+    ```
+  </Step>
+
+  <Step title="Configure yarn-site.xml">
+    Enable the shuffle service, which allows MapReduce tasks to exchange intermediate data via YARN's NodeManager.
+
+    ```xml
+    <!-- etc/hadoop/yarn-site.xml -->
+    <configuration>
+      <property>
+        <name>yarn.nodemanager.aux-services</name>
+        <value>mapreduce_shuffle</value>
+      </property>
+      <property>
+        <name>yarn.nodemanager.env-whitelist</name>
+        <value>JAVA_HOME,HADOOP_COMMON_HOME,HADOOP_HDFS_HOME,HADOOP_CONF_DIR,CLASSPATH_PREPEND_DISTCACHE,HADOOP_YARN_HOME,HADOOP_HOME,PATH,LANG,TZ,HADOOP_MAPRED_HOME</value>
+      </property>
+    </configuration>
+    ```
+  </Step>
+
+  <Step title="Format the NameNode">
+    Run this once before starting HDFS for the first time. Formatting initialises the filesystem metadata stored by the NameNode.
+
+    ```bash
+    bin/hdfs namenode -format
+    ```
+
+    <Warning>
+      Formatting destroys all existing HDFS data. Only run this command on a fresh installation or when you deliberately want to wipe the filesystem.
+    </Warning>
+  </Step>
+
+  <Step title="Start HDFS">
+    The `start-dfs.sh` script launches the NameNode, DataNode, and Secondary NameNode daemons.
+
+    ```bash
+    sbin/start-dfs.sh
+    ```
+  </Step>
+
+  <Step title="Start YARN">
+    The `start-yarn.sh` script launches the ResourceManager and NodeManager daemons.
+
+    ```bash
+    sbin/start-yarn.sh
+    ```
+  </Step>
+
+  <Step title="Verify the cluster is running">
+    Use `jps` to confirm all five daemons are running:
+
+    ```bash
+    jps
+    ```
+
+    Expected output:
+
+    ```text
+    12345 NameNode
+    12456 DataNode
+    12567 SecondaryNameNode
+    12678 ResourceManager
+    12789 NodeManager
+    ```
+
+    Then open the web UIs to inspect the cluster:
+
+    | Service | URL |
+    |---|---|
+    | NameNode | http://localhost:9870 |
+    | ResourceManager | http://localhost:8088 |
+  </Step>
+</Steps>
+
+## Run a test job
+
+Create a user directory in HDFS and run the built-in word count example to confirm everything is working:
+
+```bash
+bin/hdfs dfs -mkdir -p /user/$USER
+bin/hdfs dfs -mkdir input
+bin/hdfs dfs -put etc/hadoop/*.xml input
+bin/hadoop jar share/hadoop/mapreduce/hadoop-mapreduce-examples-*.jar grep input output 'dfs[a-z.]+'
+bin/hdfs dfs -cat output/*
+```
+
+## Stopping the cluster
+
+```bash
+sbin/stop-yarn.sh
+sbin/stop-dfs.sh
+```
+
+<Note>
+  For a fully-distributed multi-node setup, see the [cluster setup guide](/installation/cluster-setup). To build Hadoop from source instead of using a binary release, see [building from source](/installation/building-from-source).
+</Note>

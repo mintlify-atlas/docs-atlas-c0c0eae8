@@ -1,0 +1,78 @@
+---
+title: "What is Apache Hadoop? An introduction"
+description: "Apache Hadoop is an open-source framework for distributed storage and large-scale data processing across commodity hardware, built on HDFS, YARN, and MapReduce."
+---
+
+Apache Hadoop is an open-source software framework that enables distributed storage and batch processing of very large datasets across clusters of commodity hardware. Originally inspired by Google's MapReduce and Google File System papers, Hadoop was created at Yahoo in 2006 and donated to the Apache Software Foundation, where it has since become the foundational technology for large-scale data infrastructure. At its core, Hadoop solves a deceptively simple problem: how do you store and process more data than can fit on a single machine, without requiring expensive specialized hardware? It does so by distributing both the data and the computation across a cluster of ordinary servers, while handling hardware failures automatically through data replication and task retry.
+
+## Core subsystems
+
+Hadoop is composed of four tightly integrated modules. Together they form a complete platform for distributed data storage and processing.
+
+<CardGroup cols={2}>
+  <Card title="HDFS" icon="database" href="/hdfs/overview">
+    The Hadoop Distributed File System stores data across cluster nodes with configurable replication, providing fault tolerance and high aggregate read throughput for batch workloads.
+  </Card>
+  <Card title="YARN" icon="layer-group" href="/yarn/overview">
+    Yet Another Resource Negotiator manages cluster CPU and memory, scheduling applications from MapReduce to Apache Spark across shared infrastructure.
+  </Card>
+  <Card title="MapReduce" icon="shuffle" href="/mapreduce/overview">
+    A programming model and execution engine for writing parallel data processing jobs that run distributed across the cluster using the Map and Reduce paradigm.
+  </Card>
+  <Card title="Common" icon="toolbox" href="/common/filesystem-api">
+    Shared utilities and libraries used by all Hadoop modules: the FileSystem abstraction API, Configuration framework, RPC infrastructure, and security primitives.
+  </Card>
+</CardGroup>
+
+## Brief history and ecosystem context
+
+Hadoop's origins trace back to Doug Cutting and Mike Cafarella's work on the Nutch web crawler in 2003–2004. When Google published papers on GFS and MapReduce, Cutting ported the ideas into an open-source implementation. After Yahoo adopted and significantly expanded the codebase, Hadoop became an Apache top-level project in 2008. The project has since spawned a broad ecosystem — including Apache Hive (SQL-on-Hadoop), Apache HBase (column-oriented storage), Apache Spark (in-memory processing), and Apache Kafka (event streaming) — all of which can use HDFS for storage and YARN for resource management.
+
+<Note>
+  The current release requires **JDK 17** for both building from source and running Hadoop daemons. Earlier JDK versions are not supported.
+</Note>
+
+## When to use Hadoop
+
+Hadoop excels at a specific class of workloads and is not the right tool for every problem.
+
+<AccordionGroup>
+  <Accordion title="Hadoop is a strong fit when...">
+    - You need to store and process datasets in the **terabyte-to-petabyte range** that cannot fit on a single machine.
+    - Your workloads are **batch-oriented** — full table scans, aggregations, or transformations over large files read sequentially.
+    - You want **fault-tolerant, self-healing storage** without a SAN or shared-disk infrastructure.
+    - You need a **multi-tenant cluster** where different teams run different frameworks (MapReduce, Spark, Tez) against the same data.
+    - Your budget favors **commodity x86 servers** over specialized storage appliances.
+  </Accordion>
+  <Accordion title="Consider alternatives when...">
+    - Your dataset is small enough to fit on one or a few machines — simpler tools have far lower operational overhead.
+    - You need **low-latency random reads or writes** — HDFS is optimized for sequential streaming, not random access. Consider Apache HBase or Cassandra.
+    - Your processing is **interactive or iterative** and requires sub-second query times — Apache Spark with in-memory caching or a dedicated OLAP engine will outperform MapReduce significantly.
+    - Your data already lives in **object storage** (Amazon S3, Azure ADLS, Google Cloud Storage) — most modern Hadoop-ecosystem tools can read cloud storage directly without HDFS.
+  </Accordion>
+  <Accordion title="Hadoop alongside other tools">
+    Many production deployments pair Hadoop with complementary systems. HDFS serves as a durable, cheap landing zone for raw data, while downstream tools handle interactive queries. Common patterns:
+
+    - **Hive or Trino** on top of HDFS for SQL analytics without moving data
+    - **Apache Spark** using YARN for resource management while reading HDFS
+    - **DistCp** to replicate data between on-premises HDFS and cloud object storage
+    - **Apache Oozie** or **Apache Airflow** to schedule and orchestrate Hadoop jobs
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand the master/worker topology of HDFS and YARN before deploying your first cluster.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Download a pre-built binary and run a MapReduce job on a single machine in under 15 minutes.
+  </Card>
+  <Card title="Single-node setup" icon="server" href="/installation/single-node">
+    Step-by-step instructions for configuring a fully-functional pseudo-distributed cluster.
+  </Card>
+  <Card title="Cluster setup" icon="network-wired" href="/installation/cluster-setup">
+    Deploy a production-grade multi-node cluster with NameNode HA and YARN capacity scheduling.
+  </Card>
+</CardGroup>

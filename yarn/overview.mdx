@@ -1,0 +1,84 @@
+---
+title: 'YARN: Yet Another Resource Negotiator'
+description: 'Learn how YARN separates resource management from the programming model, enabling multiple compute frameworks to share a single Hadoop cluster.'
+---
+
+YARN (Yet Another Resource Negotiator) is the resource management layer introduced in Hadoop 2.x. It decouples cluster resource management from application-level execution logic, which was a fundamental limitation of the monolithic JobTracker architecture in Hadoop 1.x. In the old model, the JobTracker simultaneously scheduled tasks, tracked progress, and managed fault recovery—all of which constrained the cluster to MapReduce workloads only. YARN replaces that with a general-purpose framework that lets MapReduce, Spark, Tez, and any other compute engine coexist on the same cluster under unified resource governance.
+
+## Architecture
+
+YARN's design distributes responsibility across four cooperating components. Each component has a single, well-bounded role.
+
+<CardGroup cols={2}>
+  <Card title="ResourceManager" icon="server">
+    The global arbiter of cluster resources. Runs two internal services: the **Scheduler**, which allocates containers according to the configured policy, and the **ApplicationsManager**, which accepts job submissions and tracks running applications. Exposes a web UI at `http://resourcemanager-host:8088`.
+  </Card>
+  <Card title="NodeManager" icon="box">
+    A per-node agent that launches and monitors containers, enforces resource limits (CPU and memory), and reports node health to the ResourceManager via periodic heartbeats. It does not take scheduling decisions.
+  </Card>
+  <Card title="ApplicationMaster" icon="play">
+    One instance runs per application. It negotiates containers from the ResourceManager, coordinates execution on those containers, and handles application-level fault recovery. The ApplicationMaster itself runs inside a container on the cluster.
+  </Card>
+  <Card title="Container" icon="package">
+    The unit of allocation. A container grants a bounded amount of memory and CPU on a specific node. All application work (including the ApplicationMaster) executes inside containers.
+  </Card>
+</CardGroup>
+
+## How a job runs
+
+<Steps>
+  <Step title="Application submission">
+    A client calls `YarnClient.submitApplication()`, providing an `ApplicationSubmissionContext` that describes the ApplicationMaster container and its launch command. The ResourceManager's ApplicationsManager assigns an `ApplicationId` and hands the request to the Scheduler.
+  </Step>
+  <Step title="ApplicationMaster launch">
+    The Scheduler selects a node with available capacity and instructs the relevant NodeManager to launch the ApplicationMaster container. The NodeManager pulls the application's local resources, sets up the environment, and starts the process.
+  </Step>
+  <Step title="Resource negotiation">
+    The ApplicationMaster contacts the ResourceManager's scheduler interface (`ApplicationMasterProtocol`) to request additional containers, specifying resource requirements and locality preferences for each request.
+  </Step>
+  <Step title="Container execution">
+    The Scheduler grants containers. The ApplicationMaster sends launch specifications to the target NodeManagers via `ContainerManagementProtocol`. NodeManagers start the containers and stream logs to the configured aggregation path.
+  </Step>
+  <Step title="Completion and cleanup">
+    When all work is done, the ApplicationMaster unregisters from the ResourceManager. The ResourceManager marks the application as `FINISHED` and the containers are released back to the scheduler pool.
+  </Step>
+</Steps>
+
+## Comparison to Hadoop 1.x
+
+| Aspect | Hadoop 1.x | YARN |
+|---|---|---|
+| Resource arbiter | JobTracker | ResourceManager |
+| Per-node agent | TaskTracker | NodeManager |
+| Application lifecycle | JobTracker | ApplicationMaster (per app) |
+| Supported frameworks | MapReduce only | Any (MR, Spark, Tez, …) |
+| Scalability ceiling | ~4,000 nodes | Tens of thousands of nodes |
+| Fault domain | JobTracker is a single point of failure | RM HA with ZooKeeper failover |
+
+<Note>
+  The ResourceManager web UI at `http://resourcemanager-host:8088` provides live views of running applications, cluster node status, and scheduler queue utilization. This is the primary operational dashboard for a YARN cluster.
+</Note>
+
+## Key configuration files
+
+YARN configuration is spread across three XML files loaded at startup. The ResourceManager reads all three; the NodeManager reads `yarn-site.xml` and `node-resources.xml`.
+
+| File | Purpose |
+|---|---|
+| `yarn-site.xml` | Core cluster settings: RM address, NM resource limits, scheduler class |
+| `capacity-scheduler.xml` | Queue hierarchy and policies for the Capacity Scheduler |
+| `fair-scheduler.xml` | Pool definitions and sharing weights for the Fair Scheduler |
+
+## Explore further
+
+<CardGroup cols={3}>
+  <Card title="Resource management" icon="sliders" href="/yarn/resource-management">
+    Resource model, scheduling algorithms, preemption, and the application lifecycle in depth.
+  </Card>
+  <Card title="Capacity Scheduler" icon="chart-bar" href="/yarn/capacity-scheduler">
+    Multi-tenant hierarchical queues with guaranteed capacity per team or workload.
+  </Card>
+  <Card title="Fair Scheduler" icon="scale-balanced" href="/yarn/fair-scheduler">
+    Dynamic fair sharing that equalizes resource usage across pools over time.
+  </Card>
+</CardGroup>

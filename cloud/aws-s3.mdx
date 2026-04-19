@@ -1,0 +1,207 @@
+---
+title: 'Amazon S3 with Hadoop (S3A Connector)'
+description: 'Configure the S3A connector to read and write Amazon S3 from Hadoop. Covers authentication, core-site.xml settings, performance tuning, and common errors.'
+---
+
+The `hadoop-aws` module provides the S3A filesystem connector, which lets Hadoop jobs read from and write to Amazon S3 using the `s3a://` URI scheme. S3A replaces the older `s3://` (S3Native) and `s3n://` connectors and is the only supported connector for production use. It integrates with standard Hadoop filesystem APIs, so tools like DistCp, MapReduce, and Spark work against S3 without code changes beyond updating the URI scheme.
+
+## Adding the hadoop-aws dependency
+
+The connector is included in the `hadoop-aws` module. When building from source, activate the `hadoop-aws-package` Maven profile:
+
+```bash
+mvn package -Phadoop-aws-package -DskipTests
+```
+
+In a pre-built distribution, `hadoop-aws-<version>.jar` and `aws-java-sdk-bundle-<version>.jar` are in `share/hadoop/tools/lib/`. Ensure both are on the classpath, or add them to `HADOOP_CLASSPATH`:
+
+```bash
+export HADOOP_CLASSPATH=$HADOOP_HOME/share/hadoop/tools/lib/*:$HADOOP_CLASSPATH
+```
+
+## Authentication
+
+S3A supports several authentication methods. They are tried in the order listed below.
+
+<AccordionGroup>
+  <Accordion title="Access key and secret (explicit credentials)">
+    Set credentials directly in `core-site.xml`. Suitable for testing or environments without IAM.
+
+    ```xml core-site.xml
+    <configuration>
+      <property>
+        <name>fs.s3a.access.key</name>
+        <value>YOUR_ACCESS_KEY_ID</value>
+      </property>
+      <property>
+        <name>fs.s3a.secret.key</name>
+        <value>YOUR_SECRET_ACCESS_KEY</value>
+      </property>
+    </configuration>
+    ```
+
+    <Warning>
+      Storing plaintext credentials in `core-site.xml` is not recommended for production. Use IAM roles or a credential provider instead.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="IAM roles (recommended for EC2)">
+    When running on EC2, assign an IAM role to the instance profile. S3A automatically retrieves temporary credentials from the instance metadata service — no credentials in configuration files are needed.
+
+    The IAM role must have at minimum `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and `s3:ListBucket` permissions on the target bucket.
+  </Accordion>
+
+  <Accordion title="Credential providers">
+    S3A can retrieve credentials from Hadoop's `CredentialProvider` API, which stores them in an encrypted JCEKS keystore on HDFS.
+
+    ```bash
+    # Store credentials in a JCEKS provider
+    hadoop credential create fs.s3a.access.key -provider jceks://hdfs/user/hadoop/s3a.jceks
+    hadoop credential create fs.s3a.secret.key -provider jceks://hdfs/user/hadoop/s3a.jceks
+    ```
+
+    ```xml core-site.xml
+    <property>
+      <name>hadoop.security.credential.provider.path</name>
+      <value>jceks://hdfs/user/hadoop/s3a.jceks</value>
+    </property>
+    ```
+  </Accordion>
+
+  <Accordion title="Environment variables">
+    S3A also reads `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the environment, following standard AWS SDK conventions.
+  </Accordion>
+</AccordionGroup>
+
+## Core configuration
+
+```xml core-site.xml
+<configuration>
+  <!-- Credentials (omit when using IAM roles) -->
+  <property>
+    <name>fs.s3a.access.key</name>
+    <value>YOUR_ACCESS_KEY_ID</value>
+  </property>
+  <property>
+    <name>fs.s3a.secret.key</name>
+    <value>YOUR_SECRET_ACCESS_KEY</value>
+  </property>
+
+  <!-- Endpoint (change for non-us-east-1 regions or S3-compatible services) -->
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>s3.amazonaws.com</value>
+  </property>
+
+  <!-- Optional: path-style access (required for some S3-compatible services) -->
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>false</value>
+  </property>
+</configuration>
+```
+
+## Reading and writing
+
+```bash
+# List a bucket prefix
+hadoop fs -ls s3a://my-bucket/data/
+
+# Copy a file from HDFS to S3
+hadoop fs -cp /user/hadoop/output s3a://my-bucket/output/
+
+# Copy from S3 to HDFS
+hadoop fs -cp s3a://my-bucket/input /user/hadoop/input
+
+# Use DistCp for large-scale transfers
+hadoop distcp -direct hdfs://nn:9000/data s3a://my-bucket/data
+```
+
+## Performance tuning
+
+S3 is an object store, not a filesystem. Performance characteristics differ from HDFS. The following settings have the most impact:
+
+| Property | Default | Recommendation |
+|----------|---------|----------------|
+| `fs.s3a.block.size` | 32M | Increase to 128M–256M for large files |
+| `fs.s3a.multipart.size` | 100M | Increase to 256M for large uploads |
+| `fs.s3a.multipart.threshold` | 2147483647 | Set equal to `multipart.size` to enable multipart for all large files |
+| `fs.s3a.connection.maximum` | 96 | Increase for highly parallel workloads |
+| `fs.s3a.threads.max` | 10 | Increase for more concurrent upload threads |
+| `fs.s3a.fast.upload` | true | Keep enabled; streams directly to S3 without local spill |
+
+```xml core-site.xml
+<configuration>
+  <property>
+    <name>fs.s3a.block.size</name>
+    <value>134217728</value>
+  </property>
+  <property>
+    <name>fs.s3a.multipart.size</name>
+    <value>268435456</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.maximum</name>
+    <value>200</value>
+  </property>
+</configuration>
+```
+
+## S3A committers
+
+Traditional MapReduce and Spark output committers use rename to promote task output to the final path. On S3, rename is implemented as copy-then-delete, which is slow and not atomic. The S3A committers solve this by staging output and using S3's multipart upload complete API to commit without rename.
+
+<Tabs>
+  <Tab title="Magic committer (recommended)">
+    Writes directly to the final S3 path using pending multipart uploads. Requires the cluster to have S3A magic committer support enabled.
+
+    ```xml mapred-site.xml
+    <property>
+      <name>mapreduce.outputcommitter.factory.scheme.s3a</name>
+      <value>org.apache.hadoop.fs.s3a.commit.S3ACommitterFactory</value>
+    </property>
+    <property>
+      <name>fs.s3a.committer.name</name>
+      <value>magic</value>
+    </property>
+    ```
+  </Tab>
+  <Tab title="Staging committer">
+    Stages output to a local or HDFS temporary directory, then uploads to S3 on commit. More compatible but requires additional temporary storage.
+
+    ```xml mapred-site.xml
+    <property>
+      <name>mapreduce.outputcommitter.factory.scheme.s3a</name>
+      <value>org.apache.hadoop.fs.s3a.commit.S3ACommitterFactory</value>
+    </property>
+    <property>
+      <name>fs.s3a.committer.name</name>
+      <value>directory</value>
+    </property>
+    ```
+  </Tab>
+</Tabs>
+
+## Common errors
+
+<AccordionGroup>
+  <Accordion title="403 Access Denied">
+    The credentials provided do not have permission to perform the requested S3 operation on the target bucket or prefix. Check the IAM policy attached to the role or the access key, and ensure the bucket policy does not explicitly deny access.
+  </Accordion>
+  <Accordion title="404 Not Found">
+    The requested object or bucket does not exist. Verify the bucket name, key prefix, and region. A common cause is using `s3.amazonaws.com` as the endpoint for a bucket in a non-`us-east-1` region.
+  </Accordion>
+  <Accordion title="Endpoint mismatch">
+    S3 buckets are region-specific. If you receive redirect or region errors, set `fs.s3a.endpoint` to the bucket's region endpoint, for example `s3.eu-west-1.amazonaws.com`.
+
+    ```xml
+    <property>
+      <name>fs.s3a.endpoint</name>
+      <value>s3.eu-west-1.amazonaws.com</value>
+    </property>
+    ```
+  </Accordion>
+  <Accordion title="SdkClientException: Unable to load credentials">
+    S3A could not find valid credentials. Verify that `fs.s3a.access.key` and `fs.s3a.secret.key` are set, or that the instance is running with an IAM role attached, or that `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables are exported.
+  </Accordion>
+</AccordionGroup>

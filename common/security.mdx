@@ -1,0 +1,250 @@
+---
+title: 'Hadoop security: authentication, tokens, and TLS'
+description: 'How Hadoop authenticates users with Simple or Kerberos auth, manages delegation tokens, supports proxy users, and encrypts data in transit with TLS/SSL.'
+---
+
+Hadoop's security model is built on top of `UserGroupInformation` (UGI, in `org.apache.hadoop.security`), a class that wraps a JAAS `Subject` and exposes the authenticated identity of the current thread. This class supports the OS-level **Simple** authentication mode for development clusters and **Kerberos** (via SASL/GSSAPI) for production environments requiring strong authentication. All RPC calls between Hadoop daemons and clients carry the caller's identity, and access control decisions for HDFS files, YARN queues, and MapReduce jobs are all made against the UGI identity. Wire encryption between daemons is provided by TLS/SSL, configured separately from authentication.
+
+## Authentication modes
+
+<Tabs>
+  <Tab title="Simple (default)">
+    In Simple mode, Hadoop trusts the OS-reported username of the process. No credentials are exchanged; the client simply sends its `user.name` system property. This is appropriate only for development clusters with no external network access.
+
+    Enable Simple mode (this is the default):
+
+    ```xml core-site.xml
+    <property>
+      <name>hadoop.security.authentication</name>
+      <value>simple</value>
+    </property>
+    ```
+
+    Get the current user in Simple mode:
+
+    ```java
+    import org.apache.hadoop.security.UserGroupInformation;
+
+    UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
+    System.out.println("User: " + ugi.getUserName());
+    System.out.println("Groups: " + ugi.getGroups());
+    ```
+  </Tab>
+  <Tab title="Kerberos">
+    In Kerberos mode, clients must present a valid Kerberos ticket (TGT) before making RPC calls. Hadoop uses SASL with the GSSAPI mechanism for mutual authentication between client and server.
+
+    Enable Kerberos:
+
+    ```xml core-site.xml
+    <property>
+      <name>hadoop.security.authentication</name>
+      <value>kerberos</value>
+      <final>true</final>
+    </property>
+    <property>
+      <name>hadoop.security.authorization</name>
+      <value>true</value>
+    </property>
+    ```
+
+    <Note>
+      See [/security/kerberos](/security/kerberos) for the full Kerberos cluster setup instructions, including KDC configuration, principal creation, and keytab distribution.
+    </Note>
+  </Tab>
+</Tabs>
+
+## UserGroupInformation
+
+`UserGroupInformation` (UGI) is the central class for identity management. It wraps a JAAS `Subject` and adds Hadoop-specific concepts such as token credentials and proxy user support.
+
+### Getting the current user
+
+```java
+import org.apache.hadoop.security.UserGroupInformation;
+
+// Returns the UGI for the currently authenticated user
+UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
+
+System.out.println("Short name: " + ugi.getShortUserName());
+System.out.println("Full name:  " + ugi.getUserName());
+System.out.println("Auth type:  " + ugi.getAuthenticationMethod());
+System.out.println("Groups:     " + ugi.getGroups());
+```
+
+### Kerberos login from a keytab
+
+Long-running services (HDFS DataNode, YARN NodeManager, HBase RegionServer, etc.) authenticate using a **keytab** file rather than a user-entered password, so they can renew their Kerberos tickets without human interaction:
+
+```java
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.security.UserGroupInformation;
+
+Configuration conf = new Configuration();
+UserGroupInformation.setConfiguration(conf);
+
+// Log in from keytab — must be called once at service startup
+UserGroupInformation.loginUserFromKeytab(
+    "hbase/hostname@REALM.EXAMPLE.COM",   // Kerberos principal
+    "/etc/security/keytabs/hbase.keytab"  // keytab file path
+);
+
+UserGroupInformation ugi = UserGroupInformation.getLoginUser();
+System.out.println("Logged in as: " + ugi.getUserName());
+```
+
+After calling `loginUserFromKeytab()`, the UGI framework automatically re-authenticates (re-logins) in the background before the TGT expires, controlled by the property `hadoop.kerberos.min.seconds.before.relogin` (default: 60 seconds before expiry).
+
+### Running code as a specific user
+
+```java
+// Execute a privileged action as the logged-in user
+ugi.doAs((PrivilegedExceptionAction<Void>) () -> {
+    FileSystem fs = FileSystem.get(conf);
+    fs.listStatus(new Path("/user/alice"));
+    return null;
+});
+```
+
+## Proxy users
+
+Proxy user (impersonation) allows a **super-user** service account to act on behalf of an end user without requiring the end user's credentials. This is the standard pattern for Hadoop-connected services such as Oozie, Hive, or HBase:
+
+```xml core-site.xml
+<!-- Allow the service account 'oozie' to impersonate any user -->
+<property>
+  <name>hadoop.proxyuser.oozie.hosts</name>
+  <value>oozie-server.example.com</value>
+</property>
+<property>
+  <name>hadoop.proxyuser.oozie.groups</name>
+  <value>*</value>
+</property>
+```
+
+Create a proxy UGI in Java:
+
+```java
+// The real (authenticated) super-user UGI
+UserGroupInformation superUser = UserGroupInformation.getLoginUser();
+
+// Create a proxy UGI representing the end user
+UserGroupInformation proxyUser = UserGroupInformation.createProxyUser(
+    "alice",    // end user name
+    superUser
+);
+
+// Run file operations as Alice
+proxyUser.doAs((PrivilegedExceptionAction<Void>) () -> {
+    FileSystem fs = FileSystem.get(conf);
+    // All operations here are authorised as 'alice'
+    fs.mkdirs(new Path("/user/alice"));
+    return null;
+});
+```
+
+<Warning>
+  Proxy user permissions are enforced by the NameNode and ResourceManager. The `hadoop.proxyuser.<superuser>.hosts` property must list the exact hostname from which the impersonation request originates. Using `*` for hosts is convenient but reduces security.
+</Warning>
+
+## Delegation tokens
+
+In Kerberos environments, job submission over a long-running pipeline (for example, a MapReduce job) would require every container to have access to a KDC. Hadoop avoids this by using **delegation tokens**: a short-lived, renewable credential issued by a daemon (NameNode, ResourceManager, etc.) to a client, which the client then passes to its job containers.
+
+```java
+import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+
+// Obtain a delegation token from the NameNode
+FileSystem fs = FileSystem.get(conf);
+Token<DelegationTokenIdentifier> token =
+    fs.getDelegationToken("my-renewer-principal@REALM");
+
+// Add token to the current UGI's credentials (containers inherit these)
+UserGroupInformation.getCurrentUser().addToken(token);
+
+// Renew the token before it expires
+long expiryMs = fs.renewDelegationToken(token);
+
+// Revoke the token when no longer needed
+fs.cancelDelegationToken(token);
+```
+
+<AccordionGroup>
+  <Accordion title="Block access tokens">
+    HDFS also issues **block access tokens** (`hadoop.security.token.service.use_ip`) per block read/write operation when `dfs.block.access.token.enable` is set to `true`. These tokens are short-lived (default 10 hours) and are scoped to a single block, providing fine-grained access control at the DataNode level without requiring Kerberos on the data path.
+  </Accordion>
+  <Accordion title="Token files">
+    Tokens can be persisted to a file and re-loaded by other processes:
+
+    ```java
+    import org.apache.hadoop.security.Credentials;
+
+    // Save tokens
+    Credentials creds = UserGroupInformation.getCurrentUser().getCredentials();
+    creds.writeTokenStorageFile(new Path("/tmp/my-tokens"), conf);
+
+    // Load tokens in another process
+    Credentials loaded = Credentials.readTokenStorageFile(
+        new Path("/tmp/my-tokens"), conf);
+    UserGroupInformation.getCurrentUser().addCredentials(loaded);
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## TLS/SSL for wire encryption
+
+Authentication via Kerberos protects identity but does not encrypt data in transit by default. Enable TLS/SSL to encrypt RPC and HTTP traffic between daemons and clients:
+
+```xml core-site.xml
+<!-- Enable RPC-level data confidentiality (requires Kerberos) -->
+<property>
+  <name>hadoop.rpc.protection</name>
+  <value>privacy</value>
+  <!-- Options: authentication | integrity | privacy -->
+</property>
+
+<!-- Enable HTTPS for the web UIs -->
+<property>
+  <name>hadoop.ssl.enabled</name>
+  <value>true</value>
+</property>
+```
+
+Configure the TLS keystore and truststore in `ssl-server.xml` and `ssl-client.xml`:
+
+```xml ssl-server.xml
+<configuration>
+  <property>
+    <name>ssl.server.keystore.location</name>
+    <value>/etc/hadoop/ssl/keystore.jks</value>
+  </property>
+  <property>
+    <name>ssl.server.keystore.password</name>
+    <value>changeit</value>
+  </property>
+  <property>
+    <name>ssl.server.truststore.location</name>
+    <value>/etc/hadoop/ssl/truststore.jks</value>
+  </property>
+  <property>
+    <name>ssl.server.truststore.password</name>
+    <value>changeit</value>
+  </property>
+</configuration>
+```
+
+<Tip>
+  Set `hadoop.rpc.protection` to `privacy` on secure clusters to encrypt all RPC payloads. Using `integrity` provides tamper detection but not confidentiality. Using `authentication` (the default when Kerberos is enabled) provides mutual authentication only.
+</Tip>
+
+## Key security configuration properties
+
+| Property | Default | Description |
+|---|---|---|
+| `hadoop.security.authentication` | `simple` | Authentication mode: `simple` or `kerberos`. |
+| `hadoop.security.authorization` | `false` | Enable service-level authorization. |
+| `hadoop.rpc.protection` | `authentication` | RPC quality of protection: `authentication`, `integrity`, or `privacy`. |
+| `hadoop.kerberos.min.seconds.before.relogin` | `60` | Seconds before TGT expiry at which the UGI background thread re-logins. |
+| `hadoop.kerberos.keytab.login.autorenewal.enabled` | `false` | Enable automatic background keytab re-login. |
+| `hadoop.ssl.enabled` | `false` | Enable TLS/SSL for web UIs. |
+| `dfs.block.access.token.enable` | `false` | Enable block-level access tokens in HDFS. |

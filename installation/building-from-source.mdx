@@ -1,0 +1,301 @@
+---
+title: 'Building Apache Hadoop from source with Maven'
+description: 'Compile Apache Hadoop from source using Maven with platform-specific instructions for Ubuntu, macOS, Rocky Linux 8, and Windows, including native code builds.'
+---
+
+Building Hadoop from source gives you full control over which components are included, lets you apply patches before an official release, and is required when you need native libraries compiled for your specific platform. The build system is Maven-based and produces a standard binary distribution tarball identical in structure to official ASF releases. The easiest path for most contributors is the provided Docker environment, which pre-installs every dependency; if you prefer to build natively, the sections below cover each supported platform in detail.
+
+## Requirements
+
+| Dependency | Required version | Notes |
+|---|---|---|
+| JDK | 17 | Required for all builds |
+| Maven | 3.9.11 or later | Use `./mvnw` to download automatically |
+| Protocol Buffers | 3.25.5 | Required for native code |
+| Boost | 1.86.0 | Required for native code |
+| CMake | 3.19 or newer | Required for native code |
+| GCC | 9.3.0 or later | Or Visual Studio / Clang with `thread_local` support |
+| Zlib devel | Any recent | Required for native code |
+| Cyrus SASL devel | Any recent | Required for native code |
+
+<Note>
+  Maven 3.9.11 is not yet available in most Linux package managers as of early 2026. Use the `./mvnw` wrapper in the repository root — it downloads and validates the correct version automatically.
+</Note>
+
+## Docker build environment (recommended)
+
+The repository ships a `start-build-env.sh` script that builds and starts a Docker container with all dependencies pre-installed. This is the fastest way to get a working build environment on any platform.
+
+```bash
+# Default: Ubuntu 24, native architecture
+./start-build-env.sh
+
+# Specify OS platform
+./start-build-env.sh ubuntu_24
+./start-build-env.sh rockylinux_8
+./start-build-env.sh debian_12
+
+# Build an x86_64 container on Apple Silicon
+CPU_ARCH=x86_64 ./start-build-env.sh ubuntu_24
+```
+
+The container mounts the Hadoop source tree. Run all build commands from within the container prompt.
+
+## Platform setup
+
+<Tabs>
+  <Tab title="Ubuntu 24.04">
+    Install the JDK and build tools:
+
+    ```bash
+    sudo apt-get update
+    sudo apt-get -y install openjdk-17-jdk build-essential autoconf automake libtool cmake \
+      zlib1g-dev pkg-config libssl-dev libsasl2-dev
+    ```
+
+    Install Protocol Buffers 3.25.5:
+
+    ```bash
+    curl -L https://github.com/protocolbuffers/protobuf/archive/refs/tags/v3.25.5.tar.gz > protobuf-3.25.5.tar.gz
+    curl -L https://github.com/abseil/abseil-cpp/archive/refs/tags/20230802.1.tar.gz > abseil-cpp-20230802.1.tar.gz
+    tar -zxvf protobuf-3.25.5.tar.gz
+    tar -zxvf abseil-cpp-20230802.1.tar.gz --strip-components 1 -C protobuf-3.25.5/third_party/abseil-cpp
+    cd protobuf-3.25.5
+    cmake -S . -B build -DCMAKE_POSITION_INDEPENDENT_CODE=ON -Dprotobuf_BUILD_TESTS=OFF
+    cmake --build build --parallel $(nproc)
+    sudo cmake --install build
+    cd ..
+    ```
+
+    Install Boost 1.86.0:
+
+    ```bash
+    curl -L https://github.com/boostorg/boost/releases/download/boost-1.86.0/boost-1.86.0-b2-nodocs.tar.gz > boost-1.86.0.tar.gz
+    tar -zxf boost-1.86.0.tar.gz && cd boost-1.86.0
+    ./bootstrap.sh --prefix=/usr/
+    ./b2 --without-python
+    sudo ./b2 --without-python install
+    ```
+
+    Optional packages:
+
+    ```bash
+    sudo apt-get install libsnappy-dev bzip2 libbz2-dev fuse libfuse-dev
+    ```
+  </Tab>
+  <Tab title="macOS">
+    Install Xcode command line tools and Homebrew first:
+
+    ```bash
+    xcode-select --install
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    ```
+
+    Install JDK, Maven, and build tools:
+
+    ```bash
+    brew install openjdk@17 maven autoconf automake cmake wget openssl
+    ```
+
+    Install Protocol Buffers 3.25.5:
+
+    ```bash
+    curl -L https://github.com/protocolbuffers/protobuf/archive/refs/tags/v3.25.5.tar.gz > protobuf-3.25.5.tar.gz
+    curl -L https://github.com/abseil/abseil-cpp/archive/refs/tags/20230802.1.tar.gz > abseil-cpp-20230802.1.tar.gz
+    tar -zxvf protobuf-3.25.5.tar.gz
+    tar -zxvf abseil-cpp-20230802.1.tar.gz --strip-components 1 -C protobuf-3.25.5/third_party/abseil-cpp
+    cd protobuf-3.25.5
+    cmake -S . -B build -DCMAKE_POSITION_INDEPENDENT_CODE=ON -Dprotobuf_BUILD_TESTS=OFF
+    cmake --build build --parallel $(nproc)
+    cmake --install build
+    protoc --version
+    ```
+
+    When building native code on macOS, specify the Homebrew OpenSSL path explicitly:
+
+    ```bash
+    mvn package -Pdist,native -DskipTests -Dmaven.javadoc.skip \
+      -Dopenssl.prefix=/usr/local/opt/openssl
+    ```
+
+    <Warning>
+      Building native code from source is broken on Hadoop 3.1.1, 3.1.2, and 3.2.0 on macOS without backporting specific patches. Use a more recent release or the Docker environment if you encounter build failures.
+    </Warning>
+  </Tab>
+  <Tab title="Rocky Linux 8">
+    Install development tools and JDK:
+
+    ```bash
+    sudo dnf group install --with-optional 'Development Tools'
+    sudo dnf install java-17-openjdk-devel maven python2
+    ```
+
+    Install required libraries:
+
+    ```bash
+    sudo dnf install libtirpc-devel zlib-devel lz4-devel bzip2-devel \
+      openssl-devel cyrus-sasl-devel libpmem-devel
+    ```
+
+    Install GCC 9.3.0 (required for `thread_local` support):
+
+    ```bash
+    sudo dnf -y install gcc-toolset-9-gcc gcc-toolset-9-gcc-c++
+    source /opt/rh/gcc-toolset-9/enable
+    ```
+
+    Install Protocol Buffers 3.25.5:
+
+    ```bash
+    curl -L https://github.com/protocolbuffers/protobuf/archive/refs/tags/v3.25.5.tar.gz > protobuf-3.25.5.tar.gz
+    curl -L https://github.com/abseil/abseil-cpp/archive/refs/tags/20230802.1.tar.gz > abseil-cpp-20230802.1.tar.gz
+    tar -zxvf protobuf-3.25.5.tar.gz
+    tar -zxvf abseil-cpp-20230802.1.tar.gz --strip-components 1 -C protobuf-3.25.5/third_party/abseil-cpp
+    cd protobuf-3.25.5
+    cmake -S . -B build -DCMAKE_POSITION_INDEPENDENT_CODE=ON -Dprotobuf_BUILD_TESTS=OFF
+    cmake --build build --parallel $(nproc)
+    sudo cmake --install build --prefix /usr/local
+    cd ..
+    ```
+
+    Install Boost 1.86.0:
+
+    ```bash
+    curl -L -o boost-1.86.0.tar.gz https://github.com/boostorg/boost/releases/download/boost-1.86.0/boost-1.86.0-b2-nodocs.tar.gz
+    tar -xzf boost-1.86.0.tar.gz
+    cd boost-1.86.0
+    ./bootstrap.sh --prefix=/usr/local
+    ./b2
+    sudo ./b2 install
+    ```
+  </Tab>
+  <Tab title="Windows 10">
+    Windows builds use the `native-win` Maven profile and require Visual Studio 2019.
+
+    Required software:
+    - JDK 17
+    - Maven 3.9.11 (or use `mvnw.cmd`)
+    - Visual Studio 2019
+    - CMake 3.19 or newer
+    - Git (from git-scm.com, which includes Unix tools needed for packaging)
+
+    Install Boost, Protocol Buffers, OpenSSL, and Zlib via vcpkg:
+
+    ```bat
+    git clone https://github.com/microsoft/vcpkg.git
+    cd vcpkg
+    git fetch --all
+    git checkout 2025.03.19
+    .\bootstrap-vcpkg.bat
+    copy C:\hadoop\dev-support\docker\vcpkg\vcpkg.json C:\vcpkg
+    .\vcpkg.exe install --x-install-root .\installed
+    ```
+
+    Set environment variables:
+
+    ```bat
+    set PROTOBUF_HOME=C:\vcpkg\installed\x64-windows
+    set MAVEN_OPTS=-Xmx2048M -Xss128M
+    ```
+
+    Run the build from an **x64 Native Tools Command Prompt for VS 2019**:
+
+    ```bat
+    set classpath=
+    mvn clean package -Dhttps.protocols=TLSv1.2 -DskipTests -DskipDocs -Pnative-win,dist ^
+      -Dskip.platformToolsetDetection -Drequire.openssl ^
+      -Dopenssl.prefix=C:\vcpkg\installed\x64-windows ^
+      -Dcmake.prefix.path=C:\vcpkg\installed\x64-windows ^
+      -Dwindows.cmake.toolchain.file=C:\vcpkg\scripts\buildsystems\vcpkg.cmake ^
+      -Dwindows.cmake.build.type=RelWithDebInfo ^
+      -Dtar -Duse.platformToolsetVersion=v142
+    ```
+
+    <Note>
+      Keep the Hadoop source tree in a short path such as `C:\hdc` to avoid Windows maximum path length failures.
+    </Note>
+  </Tab>
+</Tabs>
+
+## Common build commands
+
+<CodeGroup>
+
+```bash binary distribution (no native, no docs)
+mvn package -Pdist -DskipTests -Dtar -Dmaven.javadoc.skip=true
+```
+
+```bash binary distribution with native code
+mvn package -Pdist,native -DskipTests -Dtar
+```
+
+```bash source distribution
+mvn package -Psrc -DskipTests
+```
+
+```bash source and binary with native code
+mvn package -Pdist,native,src -DskipTests -Dtar
+```
+
+</CodeGroup>
+
+## Maven build profiles
+
+| Profile | Purpose |
+|---|---|
+| `-Pdist` | Assemble the binary distribution layout |
+| `-Pnative` | Compile and bundle native libraries (Linux/macOS) |
+| `-Pnative-win` | Compile and bundle native libraries (Windows) |
+| `-Pdocs` | Generate and bundle Javadoc and site documentation |
+| `-Psrc` | Create a source tarball |
+| `-Preleasedocs` | Include changelog and release notes (requires internet) |
+| `-Pyarn-ui` | Build YARN UI v2 (requires Node.js and internet) |
+
+## Cloud connector dependencies
+
+By default, cloud connector SDK bundles are excluded from distributions to keep artifact size manageable and reduce CVE exposure. To include specific connectors, pass the corresponding property flags:
+
+```bash
+mvn package -Pdist -DskipTests -Dtar -Dmaven.javadoc.skip=true \
+  -Dhadoop-aws-package \
+  -Dhadoop-azure-datalake-package
+```
+
+Available package flags:
+
+- `-Dhadoop-aliyun-package`
+- `-Dhadoop-aws-package`
+- `-Dhadoop-azure-datalake-package`
+- `-Dhadoop-cos-package`
+- `-Dhadoop-gcp-package`
+- `-Dhadoop-huaweicloud-package`
+- `-Dhadoop-tos-package`
+
+<Warning>
+  A distribution built with all cloud connector packages will exceed the ASF infrastructure size limit and cannot be redistributed through official ASF channels.
+</Warning>
+
+## Handling out-of-memory errors
+
+Large builds can exhaust the JVM heap allocated to the Maven process. Increase the memory ceiling before running the build:
+
+```bash
+export MAVEN_OPTS="-Xms256m -Xmx1536m"
+```
+
+<Tip>
+  If you are only working on a submodule, run `mvn install -DskipTests` from the repository root once to populate the local Maven cache, then work from the submodule directory. Add `-nsu` to prevent Maven from checking for SNAPSHOT updates on every run.
+</Tip>
+
+## Building submodules individually
+
+After the initial full install, you can build and test individual submodules in isolation:
+
+```bash
+# From the repository root (first time only)
+mvn install -DskipTests -DskipShade
+
+# Then from any submodule
+cd hadoop-hdfs-project/hadoop-hdfs
+mvn package -DskipTests
+```

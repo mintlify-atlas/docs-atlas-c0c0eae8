@@ -1,0 +1,205 @@
+---
+title: 'HDFS federation: scaling beyond a single NameNode'
+description: 'Scale HDFS beyond a single NameNode using federation, block pools, Router-Based Federation, and ViewFs for transparent multi-namespace access.'
+---
+
+A single HDFS NameNode eventually becomes a scalability ceiling: because all namespace metadata lives in heap memory, a single NameNode can realistically manage tens or hundreds of millions of files before response times degrade and memory requirements become impractical. HDFS Federation addresses this by allowing multiple independent NameNodes—each owning a distinct portion of the namespace—to share the same pool of DataNodes. This gives you horizontal scalability for metadata, performance isolation between workloads, and the ability to upgrade or maintain individual namespaces independently.
+
+## HDFS Federation concepts
+
+### Multiple independent NameNodes
+
+In a federated cluster, each NameNode manages its own **namespace volume**: an independent directory tree, edit log, and fsimage. The NameNodes do not communicate with each other. A client connected to NameNode A has no visibility into NameNode B's namespace unless the client explicitly connects to it.
+
+This independence is both the strength and the complexity of federation: you gain namespace scalability and isolation, but clients must know which NameNode to connect to for a given path.
+
+### Block pools
+
+To allow multiple NameNodes to share the same DataNodes, HDFS introduces the **block pool** abstraction. Each NameNode owns exactly one block pool, identified by a unique `Block Pool ID`. A DataNode registers with every NameNode in the cluster and maintains a separate namespace on its local disk for each block pool.
+
+The `BlockPoolManager` class (`BlockPoolManager.java`) on each DataNode manages this multi-pool registration. Each block pool's data is stored in a separate subdirectory (`BP-<id>/`) on the DataNode's data directories, completely isolated from other pools. A DataNode failure or disk error in one pool does not affect another pool's data.
+
+```
+/dfs/data/
+├── BP-1234567890-192.168.1.10-1234567890/   # Block pool for NameNode 1
+│   └── current/
+│       ├── blk_1073741825
+│       └── blk_1073741826
+└── BP-9876543210-192.168.1.20-9876543210/   # Block pool for NameNode 2
+    └── current/
+        └── blk_2000000001
+```
+
+<Note>
+DataNodes send separate heartbeats and block reports to each NameNode they serve. The storage overhead is proportional to the number of federated NameNodes multiplied by the number of DataNodes.
+</Note>
+
+## When to use federation vs single NameNode HA
+
+| Scenario | Recommendation |
+|---|---|
+| Namespace has fewer than ~200 million objects | Single NameNode with HA |
+| Need to isolate development, staging, and production metadata | Federation with separate NameNodes |
+| Different teams or business units need independent upgrade cycles | Federation |
+| Single namespace is causing NameNode GC pauses or RPC timeouts | Federation to split the namespace |
+| You need to add more metadata capacity without downtime | Federation (add a new NameNode) |
+
+Federation and HA are complementary: each NameNode in a federated cluster can itself be configured as an Active/Standby HA pair.
+
+## Configuring federation
+
+Federated namespaces are declared in `hdfs-site.xml` using the `dfs.nameservices` property and per-namespace settings.
+
+```xml
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.nameservices</name>
+  <value>ns1,ns2</value>
+</property>
+
+<!-- NameNode addresses for namespace ns1 -->
+<property>
+  <name>dfs.namenode.rpc-address.ns1</name>
+  <value>namenode1.example.com:8020</value>
+</property>
+<property>
+  <name>dfs.namenode.http-address.ns1</name>
+  <value>namenode1.example.com:9870</value>
+</property>
+
+<!-- NameNode addresses for namespace ns2 -->
+<property>
+  <name>dfs.namenode.rpc-address.ns2</name>
+  <value>namenode2.example.com:8020</value>
+</property>
+<property>
+  <name>dfs.namenode.http-address.ns2</name>
+  <value>namenode2.example.com:9870</value>
+</property>
+
+<!-- Tell each DataNode about both namespaces -->
+<property>
+  <name>dfs.namenode.servicerpc-address.ns1</name>
+  <value>namenode1.example.com:8022</value>
+</property>
+<property>
+  <name>dfs.namenode.servicerpc-address.ns2</name>
+  <value>namenode2.example.com:8022</value>
+</property>
+```
+
+DataNodes are started with the full list of NameNode service addresses and will register with all of them.
+
+## ViewFs: client-side federation
+
+ViewFs provides a **client-side mount table** that maps virtual paths to paths in real namespaces. It presents a unified directory tree to the client without any server-side routing infrastructure.
+
+```xml
+<!-- core-site.xml — configure ViewFs -->
+<property>
+  <name>fs.defaultFS</name>
+  <value>viewfs://clusterX</value>
+</property>
+<property>
+  <name>fs.viewfs.mounttable.clusterX.link./data</name>
+  <value>hdfs://ns1/data</value>
+</property>
+<property>
+  <name>fs.viewfs.mounttable.clusterX.link./user</name>
+  <value>hdfs://ns2/user</value>
+</property>
+<property>
+  <name>fs.viewfs.mounttable.clusterX.linkFallback</name>
+  <value>hdfs://ns1/</value>
+</property>
+```
+
+With this configuration, a client accessing `/data/file.csv` is transparently directed to `hdfs://ns1/data/file.csv`, while `/user/alice/` resolves to `hdfs://ns2/user/alice/`.
+
+<Warning>
+ViewFs mount points cannot span namespace boundaries. An operation like `rename` that crosses a mount point (e.g., renaming `/data/file.csv` to `/user/alice/file.csv`) will fail because the source and destination are in different namespaces.
+</Warning>
+
+## Router-Based Federation (RBF)
+
+ViewFs requires every client to carry a mount table configuration. **Router-Based Federation** (RBF) moves the routing logic to a cluster of stateless **Router** processes, so clients connect to a single endpoint and are transparently forwarded to the correct NameNode.
+
+The RBF implementation lives in the `hadoop-hdfs-rbf` module. The central class is `Router` (`Router.java`), which:
+
+1. Receives a client RPC request using the standard `ClientProtocol` interface.
+2. Consults a **mount table** (stored in ZooKeeper or another state store) to determine which NameNode namespace owns the target path.
+3. Forwards the request to the Active NameNode of the appropriate subcluster via `RouterRpcClient`.
+4. Returns the response to the original client.
+
+Routers are **stateless**: they carry no namespace state themselves. Multiple Routers can run behind a load balancer. The `MountTableResolver` class resolves paths against the mount table, which is similar to ViewFs but lives server-side.
+
+### Mount table management
+
+```bash
+# Add a mount point mapping /data to namespace ns1
+hdfs dfsrouteradmin -add /data ns1 /data
+
+# Add a mount point mapping /user to namespace ns2
+hdfs dfsrouteradmin -add /user ns2 /user
+
+# List all mount points
+hdfs dfsrouteradmin -ls
+
+# Remove a mount point
+hdfs dfsrouteradmin -rm /data
+```
+
+### RBF configuration
+
+```xml
+<!-- hdfs-site.xml — Router-Based Federation -->
+<property>
+  <name>dfs.federation.router.rpc-address</name>
+  <value>0.0.0.0:8888</value>
+</property>
+<property>
+  <name>dfs.federation.router.rpc.enable</name>
+  <value>true</value>
+</property>
+<property>
+  <name>dfs.federation.router.store.driver.class</name>
+  <value>org.apache.hadoop.hdfs.server.federation.store.driver.impl.StateStoreZooKeeperImpl</value>
+</property>
+<property>
+  <name>dfs.federation.router.default.nameserviceId</name>
+  <value>ns1</value>
+</property>
+```
+
+Clients set `fs.defaultFS` to the Router's RPC address:
+
+```xml
+<!-- core-site.xml on clients -->
+<property>
+  <name>fs.defaultFS</name>
+  <value>hdfs://router.example.com:8888</value>
+</property>
+```
+
+### Starting the Router
+
+```bash
+# Start a Router process
+hdfs --daemon start dfsrouter
+
+# Check Router status
+hdfs dfsrouteradmin -getDestination /user/alice/data.csv
+```
+
+## Comparison: ViewFs vs Router-Based Federation
+
+| Aspect | ViewFs | Router-Based Federation |
+|---|---|---|
+| Mount table location | Client-side configuration file | Centralized state store (ZooKeeper) |
+| Client changes required | Yes — every client needs `core-site.xml` mount table | No — clients point to the Router endpoint |
+| Cross-namespace rename | Not supported | Supported via `RouterFederationRename` |
+| Routing component | None (client resolves locally) | Router cluster |
+| Mount table updates | Requires redistributing client config | Applied centrally, picked up by all Routers |
+| Operational complexity | Low (no extra services) | Higher (Router cluster + state store) |
+
+Choose ViewFs for smaller deployments or when clients are easily reconfigured. Use RBF when you need centralized mount table management, cross-namespace operations, or transparent client access across many teams.

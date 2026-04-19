@@ -1,0 +1,158 @@
+---
+title: 'Hadoop Archives (HAR): Small File Archival'
+description: 'Bundle thousands of small files into a single HAR archive to reduce NameNode memory pressure. Covers creation, access, limitations, and extraction.'
+---
+
+Every file stored in HDFS, regardless of size, consumes a fixed amount of memory in the NameNode's heap — typically around 150 bytes of metadata per file. A cluster with millions of small files can exhaust NameNode memory and degrade overall cluster performance even when total data volume is modest. Hadoop Archives (HAR) address this by packing many small files into a single archive that appears as a directory to the `har://` filesystem, reducing the number of objects the NameNode must track.
+
+## How HAR files work
+
+A `.har` archive is stored on HDFS as a directory containing a few large part files plus index files. The `HarFileSystem` layer reads the index to locate individual files within the part files. From the NameNode's perspective, a `.har` directory holding thousands of original files might contain only a handful of actual HDFS objects.
+
+<Note>
+  The NameNode still stores one metadata entry for each part file inside the `.har` directory plus the index files. The reduction in NameNode entries is significant but not proportional to one-to-one compression.
+</Note>
+
+## Creating an archive
+
+```bash
+hadoop archive \
+  -archiveName output.har \
+  -p /parent/path \
+  /src1 /src2 \
+  /dest/directory
+```
+
+| Argument | Description |
+|----------|-------------|
+| `-archiveName` | Name of the archive file to create (must end in `.har`) |
+| `-p` | Parent path relative to which source paths are recorded in the archive |
+| `/src1 /src2` | Source paths under the parent to include |
+| `/dest/directory` | HDFS destination directory where the `.har` will be created |
+
+### Example: archive a logs directory
+
+```bash
+hadoop archive \
+  -archiveName logs-2024.har \
+  -p /data/logs \
+  /data/logs/january \
+  /data/logs/february \
+  /warehouse/archives
+```
+
+This creates `/warehouse/archives/logs-2024.har` on HDFS.
+
+You can also control the replication factor of the archive parts:
+
+```bash
+hadoop archive \
+  -archiveName output.har \
+  -r 1 \
+  -p /data/cold \
+  /data/cold/partition1 \
+  /warehouse/archives
+```
+
+## Accessing HAR files
+
+Read files through the `har://` URI scheme:
+
+```bash
+# List the contents of an archive
+hadoop fs -ls har:///warehouse/archives/logs-2024.har/
+
+# List a subdirectory inside the archive
+hadoop fs -ls har:///warehouse/archives/logs-2024.har/january/
+
+# Print a file from inside the archive
+hadoop fs -cat har:///warehouse/archives/logs-2024.har/january/app.log
+```
+
+The URI format is:
+
+```text
+har://[namenode:port]/path/to/output.har/[inner/path]
+```
+
+When using the default filesystem (configured in `core-site.xml`), the host and port can be omitted:
+
+```text
+har:///warehouse/archives/logs-2024.har/january/app.log
+```
+
+### Using HAR files as MapReduce input
+
+You can point MapReduce jobs directly at a HAR path:
+
+```bash
+hadoop jar my-job.jar \
+  -input har:///warehouse/archives/logs-2024.har/ \
+  -output /results/log-analysis
+```
+
+## Extracting files from a HAR archive
+
+HAR files do not support random writes or append operations. To retrieve files, copy them out:
+
+```bash
+# Extract a single file
+hadoop fs -cp har:///warehouse/archives/logs-2024.har/january/app.log /restore/app.log
+
+# Extract the entire archive contents
+hadoop fs -cp har:///warehouse/archives/logs-2024.har/ /restore/logs-2024/
+```
+
+## Limitations
+
+<Warning>
+  HAR archives are read-only. You cannot add, remove, or modify files after creation. If you need to update archived data, you must create a new archive.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="No random writes or append">
+    Once created, a `.har` file is immutable. There is no mechanism to add files to an existing archive or overwrite a file within it.
+  </Accordion>
+  <Accordion title="NameNode metadata still exists per part file">
+    The NameNode tracks the index files and data part files inside the `.har` directory. For very small archives (a few dozen files), the savings may be modest. HAR is most effective when consolidating tens of thousands of files.
+  </Accordion>
+  <Accordion title="No transparent compression">
+    HAR archives concatenate files but do not compress them. If you also want to reduce storage, compress the source files before archiving, or use a format like ORC or Parquet instead.
+  </Accordion>
+  <Accordion title="Read performance">
+    Reads involve an index lookup followed by a seek into a large part file. For latency-sensitive workloads or files that are frequently accessed individually, HDFS native storage may be preferable.
+  </Accordion>
+</AccordionGroup>
+
+## When to use HAR
+
+<CardGroup cols={2}>
+  <Card title="Cold data archival" icon="archive">
+    Data that is rarely accessed but must be retained. Archive old partitions to reduce NameNode pressure while keeping data accessible.
+  </Card>
+  <Card title="Small file consolidation" icon="files">
+    Directories with millions of tiny files generated by streaming ingestion pipelines or sensors.
+  </Card>
+  <Card title="Batch-read workloads" icon="layers">
+    Archived data that is only read by bulk MapReduce or Spark jobs, where sequential scan performance is acceptable.
+  </Card>
+  <Card title="Compliance retention" icon="lock">
+    Long-term retention of log data or audit trails where immutability is a feature rather than a limitation.
+  </Card>
+</CardGroup>
+
+## Deleting the original files
+
+After verifying the archive is complete and accessible, delete the originals to reclaim NameNode entries:
+
+```bash
+# Verify the archive
+hadoop fs -ls har:///warehouse/archives/logs-2024.har/january/ | wc -l
+
+# Remove originals
+hadoop fs -rm -r /data/logs/january /data/logs/february
+```
+
+<Warning>
+  Always verify archive integrity before removing the source files. There is no built-in checksum verification in HAR; use `hadoop fs -cat` on a sample of files to confirm they are readable.
+</Warning>

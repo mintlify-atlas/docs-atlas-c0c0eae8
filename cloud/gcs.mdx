@@ -1,0 +1,188 @@
+---
+title: 'Google Cloud Storage with Hadoop (GCS Connector)'
+description: 'Use the gs:// connector from hadoop-gcp to read and write Google Cloud Storage. Covers authentication, core-site.xml settings, and performance trade-offs.'
+---
+
+The `hadoop-gcp` module (part of the `hadoop-cloud-storage-project`) provides a connector for Google Cloud Storage (GCS) using the `gs://` URI scheme. It implements the Hadoop FileSystem API so existing MapReduce jobs, DistCp transfers, and Spark workloads can read and write GCS without code changes. The connector uses the Google Cloud Storage JSON API under the hood and supports both service account key file authentication and Application Default Credentials.
+
+## Adding the hadoop-gcp dependency
+
+Build the module from source with the `hadoop-gcp-package` Maven profile:
+
+```bash
+mvn package -Phadoop-gcp-package -DskipTests
+```
+
+In a pre-built distribution that includes GCS support, add the connector JARs to the classpath:
+
+```bash
+export HADOOP_CLASSPATH=$HADOOP_HOME/share/hadoop/tools/lib/*:$HADOOP_CLASSPATH
+```
+
+## Authentication
+
+<AccordionGroup>
+  <Accordion title="Service account key file (explicit)">
+    Create a service account in Google Cloud IAM, grant it the Storage Object Admin or Storage Object Viewer role on the bucket, and download a JSON key file.
+
+    ```xml core-site.xml
+    <configuration>
+      <property>
+        <name>google.cloud.auth.service.account.enable</name>
+        <value>true</value>
+      </property>
+      <property>
+        <name>google.cloud.auth.service.account.json.keyfile</name>
+        <value>/etc/hadoop/conf/gcs-keyfile.json</value>
+      </property>
+    </configuration>
+    ```
+
+    The key file path must be accessible on every node in the cluster that will run tasks. Distribute it via a configuration management tool or store it in a shared location mounted on all nodes.
+  </Accordion>
+
+  <Accordion title="Application Default Credentials">
+    When running on Google Compute Engine or GKE, Application Default Credentials (ADC) are available automatically from the instance metadata service. No key file is needed.
+
+    ```xml core-site.xml
+    <configuration>
+      <property>
+        <name>google.cloud.auth.service.account.enable</name>
+        <value>false</value>
+      </property>
+    </configuration>
+    ```
+
+    Outside GCE/GKE, run `gcloud auth application-default login` to store local credentials, or set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable to point to a service account key file.
+  </Accordion>
+</AccordionGroup>
+
+## Core configuration
+
+```xml core-site.xml
+<configuration>
+  <!-- Register the GCS AbstractFileSystem implementation -->
+  <property>
+    <name>fs.AbstractFileSystem.gs.impl</name>
+    <value>com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS</value>
+  </property>
+
+  <!-- Register the GCS FileSystem implementation -->
+  <property>
+    <name>fs.gs.impl</name>
+    <value>com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem</value>
+  </property>
+
+  <!-- Your GCP project ID -->
+  <property>
+    <name>fs.gs.project.id</name>
+    <value>my-gcp-project</value>
+  </property>
+
+  <!-- Service account authentication -->
+  <property>
+    <name>google.cloud.auth.service.account.enable</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>google.cloud.auth.service.account.json.keyfile</name>
+    <value>/etc/hadoop/conf/gcs-keyfile.json</value>
+  </property>
+</configuration>
+```
+
+## Reading and writing
+
+```bash
+# List a bucket
+hadoop fs -ls gs://my-bucket/
+
+# List a prefix
+hadoop fs -ls gs://my-bucket/data/2024/
+
+# Copy a file from HDFS to GCS
+hadoop fs -cp /user/hadoop/output gs://my-bucket/output/
+
+# Copy from GCS to HDFS
+hadoop fs -cp gs://my-bucket/input /user/hadoop/input
+
+# Large-scale transfer with DistCp
+hadoop distcp hdfs://nn:9000/data/warehouse gs://my-bucket/warehouse
+```
+
+## Running MapReduce jobs against GCS
+
+You can use GCS paths directly as MapReduce input and output:
+
+```bash
+hadoop jar $HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-*.jar \
+  wordcount \
+  gs://my-bucket/input/text \
+  gs://my-bucket/output/wordcount
+```
+
+## Performance considerations
+
+GCS is an object store with different performance characteristics than HDFS. The following factors affect throughput and latency:
+
+<AccordionGroup>
+  <Accordion title="No true atomic rename">
+    Like S3, GCS does not support server-side atomic rename. The connector emulates directory rename as a series of object copies followed by deletes. Avoid workloads that rely on frequent directory renames (such as the default Spark output committer). Use a GCS-specific committer instead.
+  </Accordion>
+
+  <Accordion title="Eventually consistent directory listings (legacy buckets)">
+    GCS offers strong consistency for object creation and deletion, but directory listing consistency depends on whether you are using a dual-region or multi-region bucket. Object metadata operations are strongly consistent in all bucket types as of 2021.
+  </Accordion>
+
+  <Accordion title="Block size and read-ahead">
+    GCS has no concept of block placement. Setting `fs.gs.block.size` controls the logical block size reported to Hadoop for input split calculations. Increase it for large files to reduce the number of splits.
+
+    ```xml core-site.xml
+    <property>
+      <name>fs.gs.block.size</name>
+      <value>134217728</value>
+    </property>
+    ```
+  </Accordion>
+
+  <Accordion title="Parallel composite uploads">
+    For large files, the connector can split uploads into parallel components. Enable with `fs.gs.outputstream.upload.chunk.size` to control chunk size.
+
+    ```xml core-site.xml
+    <property>
+      <name>fs.gs.outputstream.upload.chunk.size</name>
+      <value>67108864</value>
+    </property>
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### GCS vs HDFS for batch workloads
+
+| Characteristic | HDFS | GCS |
+|----------------|------|-----|
+| Data locality | Yes — compute and storage co-located | No — network I/O for every read |
+| Atomic rename | Yes | No — emulated with copy + delete |
+| Scalability | Limited by NameNode | Virtually unlimited |
+| Durability | Configurable replication | 11 nines (multi-region) |
+| Cost model | Fixed cluster cost | Pay-per-use |
+| Best for | Iterative algorithms, shuffle-heavy jobs | Storage tier, archival, infrequent reads |
+
+<Tip>
+  For shuffle-heavy Spark or MapReduce jobs, keep intermediate data in HDFS or local disks and only write final output to GCS. Reading shuffle data from GCS over the network is significantly slower than reading from local HDFS DataNodes.
+</Tip>
+
+## Configuring the default filesystem
+
+To make `gs://` the default filesystem so you can omit the scheme in paths:
+
+```xml core-site.xml
+<property>
+  <name>fs.defaultFS</name>
+  <value>gs://my-bucket</value>
+</property>
+```
+
+<Warning>
+  Setting `fs.defaultFS` to a GCS bucket is appropriate for Dataproc clusters provisioned by Google Cloud. On a traditional HDFS cluster, changing `fs.defaultFS` away from `hdfs://` will break YARN and most Hadoop internals. Keep `fs.defaultFS` pointing to HDFS and use the `gs://` scheme explicitly.
+</Warning>

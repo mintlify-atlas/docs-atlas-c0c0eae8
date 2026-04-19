@@ -1,80 +1,344 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quickstart: run Hadoop locally"
+description: "Download a pre-built Hadoop binary, start HDFS and YARN on a single machine, and submit your first MapReduce WordCount job in under 15 minutes."
 ---
 
-## Get started in three steps
+This quickstart walks you through downloading a pre-built Hadoop binary, configuring it on a single machine in pseudo-distributed mode, starting the HDFS and YARN daemons, and verifying your cluster by running the bundled WordCount example. Pseudo-distributed mode runs all Hadoop daemons as separate JVM processes on one machine, giving you a fully functional cluster that behaves identically to a multi-node deployment — making it the fastest way to learn Hadoop before scaling out.
 
-Get your documentation site running locally and make your first customization.
+<Note>
+  Hadoop requires **Java 17**. Confirm your Java version before proceeding:
 
-### Step 1: Set up your local environment
+  ```bash
+  java -version
+  ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+  You should see output containing `openjdk version "17"` or similar. If not, install OpenJDK 17 from your package manager before continuing.
+</Note>
 
-### Step 2: Deploy your changes
+<Steps>
+  <Step title="Download the Hadoop binary">
+    Download the latest pre-built Hadoop release from the Apache Hadoop downloads page. Replace the version number in the commands below with the current stable release if it differs.
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash
+    wget https://downloads.apache.org/hadoop/common/stable/hadoop-3.4.1.tar.gz
+    tar -xzf hadoop-3.4.1.tar.gz
+    mv hadoop-3.4.1 /opt/hadoop
+    ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    <Tip>
+      Verify the download against the published SHA-512 checksum before extracting in production environments. The checksum file is available alongside the tarball on the Apache downloads page.
+    </Tip>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    After extraction you will have a directory layout like this:
 
-### Step 3: Go live
+    ```
+    /opt/hadoop/
+    ├── bin/          # hadoop, hdfs, yarn, mapred CLIs
+    ├── sbin/         # daemon start/stop scripts
+    ├── etc/hadoop/   # configuration files
+    ├── share/hadoop/ # JARs, including example jobs
+    └── lib/          # native libraries
+    ```
+  </Step>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+  <Step title="Set JAVA_HOME">
+    Hadoop needs to know where Java is installed. Set `JAVA_HOME` in `etc/hadoop/hadoop-env.sh` — this is the authoritative location and overrides any shell environment variable.
+
+    Open `/opt/hadoop/etc/hadoop/hadoop-env.sh` and find the `JAVA_HOME` line. Uncomment it and set it to your JDK path:
+
+    ```bash
+    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    ```
+
+    <Tabs>
+      <Tab title="Ubuntu / Debian">
+        ```bash
+        # Find your JDK path
+        update-java-alternatives --list
+
+        # Then set it in hadoop-env.sh:
+        export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+        ```
+      </Tab>
+      <Tab title="macOS (Homebrew)">
+        ```bash
+        # Find your JDK path
+        /usr/libexec/java_home -v 17
+
+        # Then set it in hadoop-env.sh:
+        export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+        ```
+      </Tab>
+      <Tab title="Rocky Linux / RHEL">
+        ```bash
+        # Find your JDK path
+        alternatives --list | grep java
+
+        # Then set it in hadoop-env.sh:
+        export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+        ```
+      </Tab>
+    </Tabs>
+
+    Also add Hadoop's `bin` directory to your shell's `PATH` for convenience:
+
+    ```bash
+    export HADOOP_HOME=/opt/hadoop
+    export PATH=$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin
+    ```
+
+    Add these lines to your `~/.bashrc` or `~/.zshrc` and run `source ~/.bashrc` to apply them.
+  </Step>
+
+  <Step title="Configure pseudo-distributed mode">
+    Three configuration files need minimal edits to enable pseudo-distributed mode. All files are in `/opt/hadoop/etc/hadoop/`.
+
+    **`core-site.xml`** — tells Hadoop to use a local HDFS instance as the default file system:
+
+    ```xml core-site.xml
+    <configuration>
+      <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://localhost:9000</value>
+      </property>
+    </configuration>
+    ```
+
+    **`hdfs-site.xml`** — sets replication to 1 (appropriate for a single-node setup):
+
+    ```xml hdfs-site.xml
+    <configuration>
+      <property>
+        <name>dfs.replication</name>
+        <value>1</value>
+      </property>
+    </configuration>
+    ```
+
+    **`mapred-site.xml`** — tells MapReduce to use YARN as the execution framework:
+
+    ```xml mapred-site.xml
+    <configuration>
+      <property>
+        <name>mapreduce.framework.name</name>
+        <value>yarn</value>
+      </property>
+      <property>
+        <name>mapreduce.application.classpath</name>
+        <value>$HADOOP_MAPRED_HOME/share/hadoop/mapreduce/*:$HADOOP_MAPRED_HOME/share/hadoop/mapreduce/lib/*</value>
+      </property>
+    </configuration>
+    ```
+
+    **`yarn-site.xml`** — enables the MapReduce shuffle service on NodeManagers:
+
+    ```xml yarn-site.xml
+    <configuration>
+      <property>
+        <name>yarn.nodemanager.aux-services</name>
+        <value>mapreduce_shuffle</value>
+      </property>
+    </configuration>
+    ```
+  </Step>
+
+  <Step title="Configure SSH for localhost">
+    The Hadoop start scripts use SSH to launch daemons. On a single node you need passwordless SSH to `localhost`:
+
+    ```bash
+    # Install openssh-server if not already present
+    sudo apt-get install -y openssh-server   # Ubuntu/Debian
+    # sudo dnf install -y openssh-server     # Rocky Linux
+
+    # Generate an SSH key if you don't have one
+    ssh-keygen -t rsa -P '' -f ~/.ssh/id_rsa
+
+    # Authorize it for localhost login
+    cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+    chmod 0600 ~/.ssh/authorized_keys
+
+    # Verify passwordless login works
+    ssh localhost
+    ```
+
+    If `ssh localhost` connects without prompting for a password, you are ready to proceed.
+  </Step>
+
+  <Step title="Format the NameNode">
+    Before starting HDFS for the first time you must format the NameNode. This initializes the on-disk metadata structures (the FSImage) in the directory configured by `dfs.namenode.name.dir` (defaults to `/tmp/hadoop-$USER/dfs/name`).
+
+    ```bash
+    hdfs namenode -format
+    ```
+
+    Successful output includes a line like:
+
+    ```
+    Storage directory /tmp/hadoop-<user>/dfs/name has been successfully formatted.
+    ```
+
+    <Warning>
+      Running `hdfs namenode -format` on an existing cluster **destroys all namespace metadata**. Only run this command when setting up a fresh cluster.
+    </Warning>
+  </Step>
+
+  <Step title="Start HDFS">
+    Start the NameNode and DataNode daemons using the provided script:
+
+    ```bash
+    start-dfs.sh
+    ```
+
+    You should see output indicating that the NameNode, DataNode, and Secondary NameNode have been started. Verify with the `jps` (Java process status) command:
+
+    ```bash
+    jps
+    ```
+
+    Expected output:
+
+    ```
+    12345 NameNode
+    12456 DataNode
+    12567 SecondaryNameNode
+    12678 Jps
+    ```
+
+    You can also inspect the HDFS web UI at `http://localhost:9870` to confirm the cluster is healthy.
+
+    ```bash
+    # Create a home directory in HDFS for your user
+    hdfs dfs -mkdir -p /user/$USER
+    ```
+  </Step>
+
+  <Step title="Start YARN">
+    Start the ResourceManager and NodeManager daemons:
+
+    ```bash
+    start-yarn.sh
+    ```
+
+    Verify with `jps`:
+
+    ```bash
+    jps
+    ```
+
+    Expected output now includes:
+
+    ```
+    12345 NameNode
+    12456 DataNode
+    12567 SecondaryNameNode
+    12789 ResourceManager
+    12890 NodeManager
+    12901 Jps
+    ```
+
+    The YARN ResourceManager web UI is available at `http://localhost:8088`.
+  </Step>
+
+  <Step title="Verify HDFS with basic commands">
+    Confirm HDFS is working by creating a directory and listing the root:
+
+    ```bash
+    # List the root of HDFS
+    hadoop fs -ls /
+
+    # Create a directory for input data
+    hadoop fs -mkdir -p /user/$USER/input
+
+    # Upload a local file to HDFS
+    echo "the quick brown fox jumps over the lazy dog" > /tmp/sample.txt
+    hadoop fs -put /tmp/sample.txt /user/$USER/input/
+
+    # Confirm the file was stored
+    hadoop fs -ls /user/$USER/input/
+    ```
+
+    You should see `sample.txt` listed with its size, replication factor, and timestamps.
+  </Step>
+
+  <Step title="Submit the WordCount example job">
+    Hadoop ships with a collection of example MapReduce jobs in `share/hadoop/mapreduce/`. Run the WordCount example against the file you just uploaded:
+
+    ```bash
+    hadoop jar \
+      share/hadoop/mapreduce/hadoop-mapreduce-examples-*.jar \
+      wordcount \
+      /user/$USER/input \
+      /user/$USER/output
+    ```
+
+    You will see log output from the MapReduce ApplicationMaster showing map and reduce progress:
+
+    ```
+    ...
+    INFO mapreduce.Job: map 0% reduce 0%
+    INFO mapreduce.Job: map 100% reduce 0%
+    INFO mapreduce.Job: map 100% reduce 100%
+    INFO mapreduce.Job: Job job_XXXX_0001 completed successfully
+    ...
+    ```
+
+    <Note>
+      If the job already ran and `/user/$USER/output` exists, delete it first: `hadoop fs -rm -r /user/$USER/output`. MapReduce refuses to write to an existing output directory.
+    </Note>
+  </Step>
+
+  <Step title="Verify the output">
+    Read the output file to confirm the job ran correctly:
+
+    ```bash
+    hadoop fs -cat /user/$USER/output/part-r-00000
+    ```
+
+    Expected output (word counts for the sample sentence):
+
+    ```
+    brown	1
+    dog	1
+    fox	1
+    jumps	1
+    lazy	1
+    over	1
+    quick	1
+    the	2
+    ```
+
+    You can also list all output files:
+
+    ```bash
+    hadoop fs -ls /user/$USER/output/
+    ```
+
+    The `_SUCCESS` file indicates the job completed without errors.
+  </Step>
+</Steps>
+
+## Stopping the cluster
+
+When you are done, stop the daemons cleanly to release resources:
+
+```bash
+stop-yarn.sh
+stop-dfs.sh
+```
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="HDFS commands" icon="terminal" href="/hdfs/overview">
+    Explore the full `hadoop fs` command reference for managing files, directories, and permissions.
+  </Card>
+  <Card title="Single-node setup" icon="server" href="/installation/single-node">
+    Detailed configuration guide for pseudo-distributed mode with persistent storage directories.
+  </Card>
+  <Card title="MapReduce overview" icon="shuffle" href="/mapreduce/overview">
+    Write your own Map and Reduce functions and understand input formats and job configuration.
+  </Card>
+  <Card title="Cluster setup" icon="network-wired" href="/installation/cluster-setup">
+    Deploy a production multi-node cluster with NameNode HA and YARN capacity scheduling.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

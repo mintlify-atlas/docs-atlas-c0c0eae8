@@ -1,0 +1,122 @@
+---
+title: 'MapReduce: parallel data processing on Hadoop'
+description: 'Learn how Hadoop MapReduce processes large datasets in parallel across a cluster using the Map, Shuffle, and Reduce phases running on YARN.'
+---
+
+MapReduce is a programming model and execution framework for processing large datasets in parallel across a cluster of commodity hardware. A MapReduce program is expressed as two user-defined functions — a **mapper** and a **reducer** — and Hadoop handles all the complexity of distributing work, tolerating failures, and moving data between nodes. The model was popularized by a 2004 Google paper and remains the foundation of the Hadoop processing stack, running on top of YARN (Yet Another Resource Negotiator).
+
+## How MapReduce works
+
+A MapReduce job passes through three principal phases: Map, Shuffle and Sort, and Reduce.
+
+### Map phase
+
+The framework splits the input data into fixed-size chunks called **input splits**. One map task is launched per split. The mapper reads records from its split using a `RecordReader` (backed by an `InputFormat` such as `TextInputFormat`) and calls your `map()` function once per record. Each call emits zero or more intermediate key-value pairs into the framework via `context.write(key, value)`.
+
+Map tasks run locally on (or close to) the node that holds the data, minimising network I/O — a principle known as **data locality**.
+
+### Shuffle and sort phase
+
+After all mappers complete, the framework performs the **shuffle**: it partitions each mapper's output by key using a `Partitioner`, transfers the relevant partitions to the reducer nodes over the network, and then **sorts** all values within each partition by key. This phase is entirely managed by the framework; no user code is required.
+
+A **combiner** (also called a local reducer) can be specified to pre-aggregate mapper output on the same node before the data is transferred across the network. Using the reducer itself as a combiner is valid when the reduce operation is commutative and associative (for example, summation).
+
+### Reduce phase
+
+Each reducer receives a sorted stream of `(key, Iterable<values>)` pairs for its assigned key range, calls your `reduce()` function once per distinct key, and writes the final output via `context.write()`. Output is written to HDFS (or another `OutputFormat` sink) as part files named `part-r-NNNNN`.
+
+## Execution on YARN
+
+<Steps>
+  <Step title="Job submission">
+    The client calls `job.waitForCompletion(true)`, which contacts the YARN ResourceManager and uploads the job JAR, configuration, and split metadata to HDFS under a staging directory.
+  </Step>
+  <Step title="ApplicationMaster launch">
+    YARN starts a MapReduce ApplicationMaster (MRAppMaster) in a container. The ApplicationMaster negotiates further containers from the ResourceManager for map and reduce tasks.
+  </Step>
+  <Step title="Map tasks">
+    Map tasks run in YARN containers, ideally on the node that stores their input split. Progress is reported back to the ApplicationMaster.
+  </Step>
+  <Step title="Reduce tasks">
+    Once enough map tasks complete, reduce tasks begin fetching (shuffling) mapper output. Reduce tasks may start before all mappers finish, overlapping shuffle and map execution.
+  </Step>
+  <Step title="Completion">
+    When all reduce tasks succeed, the ApplicationMaster reports job completion to the client and releases its containers.
+  </Step>
+</Steps>
+
+## Input and output formats
+
+The `InputFormat` interface controls how input data is split and how records are presented to mappers. `OutputFormat` controls how reducer output is written.
+
+<Tabs>
+  <Tab title="Built-in input formats">
+    | Class | Description |
+    |---|---|
+    | `TextInputFormat` | Default. Each line is a record; key is byte offset, value is the line text. |
+    | `KeyValueTextInputFormat` | Tab-separated key and value per line. |
+    | `SequenceFileInputFormat` | Binary format for chaining MapReduce jobs. |
+    | `NLineInputFormat` | Splits input so each mapper gets exactly N lines. |
+    | `CombineFileInputFormat` | Combines many small files into fewer splits. |
+  </Tab>
+  <Tab title="Built-in output formats">
+    | Class | Description |
+    |---|---|
+    | `TextOutputFormat` | Default. Writes tab-separated key and value per line. |
+    | `SequenceFileOutputFormat` | Binary format, suitable as input to a subsequent job. |
+    | `MapFileOutputFormat` | Writes a sorted, indexed `MapFile`. |
+    | `MultipleOutputs` | Write output to multiple named files from a single job. |
+  </Tab>
+</Tabs>
+
+## Partitioners and combiners
+
+<AccordionGroup>
+  <Accordion title="Partitioner">
+    The `Partitioner` determines which reducer receives each intermediate key. The default `HashPartitioner` computes `key.hashCode() % numReducers`. You can supply a custom `Partitioner` subclass via `job.setPartitionerClass()` to route keys by range or any other criterion — useful for producing sorted output across reducer output files.
+  </Accordion>
+  <Accordion title="Combiner">
+    A combiner is an optional local pre-reducer executed on the mapper node before the shuffle. It receives the same `(key, Iterable<values>)` input as a reducer and must produce output of the same types. Because the framework may invoke combiners zero, one, or multiple times, the operation must be idempotent. Set one with `job.setCombinerClass(MyReducer.class)`.
+  </Accordion>
+  <Accordion title="Custom partitioner example">
+    ```java
+    public class RangePartitioner extends Partitioner<Text, IntWritable> {
+      @Override
+      public int getPartition(Text key, IntWritable value, int numPartitions) {
+        char first = key.toString().charAt(0);
+        if (first < 'n') return 0 % numPartitions;
+        return 1 % numPartitions;
+      }
+    }
+    ```
+    Register with: `job.setPartitionerClass(RangePartitioner.class);`
+  </Accordion>
+</AccordionGroup>
+
+## Counters
+
+The framework provides built-in counters (bytes read/written, records processed, etc.) and supports user-defined counters. Increment a counter in your mapper or reducer with:
+
+```java
+context.getCounter("MyGroup", "MyCounter").increment(1);
+```
+
+Counter values are aggregated across all tasks and available via the `Job` object after completion or in the YARN history server web UI.
+
+<Note>
+  Job counters are eventually consistent during execution. Do not rely on them for real-time coordination between tasks.
+</Note>
+
+## Next steps
+
+<CardGroup cols={3}>
+  <Card title="WordCount tutorial" icon="graduation-cap" href="/mapreduce/tutorial">
+    Build, package, and run the canonical WordCount example from source.
+  </Card>
+  <Card title="API compatibility" icon="arrows-left-right" href="/mapreduce/compatibility">
+    Understand the differences between the old `mapred` API and the new `mapreduce` API and how to migrate.
+  </Card>
+  <Card title="YARN overview" icon="diagram-project" href="/yarn/overview">
+    Learn how YARN schedules and manages resources across the cluster.
+  </Card>
+</CardGroup>

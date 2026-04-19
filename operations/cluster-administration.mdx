@@ -1,0 +1,304 @@
+---
+title: "Hadoop cluster administration: start, stop, and monitor"
+description: "Start, stop, and monitor Hadoop cluster services. Covers web UIs, log management, health checks, node decommission, and rolling upgrades."
+---
+
+Managing a Hadoop cluster day-to-day involves starting and stopping services across multiple nodes, monitoring their health through web interfaces and command-line tools, managing log output, and responding to failures. Understanding these operational fundamentals is essential before attempting any cluster change—whether adding capacity, upgrading software, or decommissioning hardware.
+
+## Starting and stopping services
+
+Hadoop ships with shell scripts that coordinate daemon startup and shutdown across the cluster. Run these scripts from the node designated as your management host (typically the machine that holds the NameNode or ResourceManager).
+
+<Tabs>
+  <Tab title="HDFS">
+    ```bash
+    # Start all HDFS daemons (NameNode, DataNodes, Secondary NameNode)
+    $HADOOP_HOME/sbin/start-dfs.sh
+
+    # Stop all HDFS daemons
+    $HADOOP_HOME/sbin/stop-dfs.sh
+    ```
+  </Tab>
+  <Tab title="YARN">
+    ```bash
+    # Start ResourceManager and all NodeManagers
+    $HADOOP_HOME/sbin/start-yarn.sh
+
+    # Stop YARN daemons
+    $HADOOP_HOME/sbin/stop-yarn.sh
+    ```
+  </Tab>
+  <Tab title="All services">
+    ```bash
+    # Start HDFS and YARN together
+    $HADOOP_HOME/sbin/start-all.sh
+
+    # Stop all services
+    $HADOOP_HOME/sbin/stop-all.sh
+    ```
+  </Tab>
+  <Tab title="Individual daemons">
+    ```bash
+    # Start or stop a single daemon on the local node
+    $HADOOP_HOME/bin/hdfs --daemon start namenode
+    $HADOOP_HOME/bin/hdfs --daemon stop datanode
+    $HADOOP_HOME/bin/yarn --daemon start resourcemanager
+    $HADOOP_HOME/bin/yarn --daemon stop nodemanager
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+`start-all.sh` and `stop-all.sh` rely on passwordless SSH from the management host to every worker node. Confirm SSH access before running them.
+</Note>
+
+## Checking service status
+
+Use the `jps` (Java Virtual Machine Process Status) command on each node to confirm that the expected JVM processes are running.
+
+```bash
+# On a NameNode host
+jps
+# Expected output includes: NameNode, SecondaryNameNode (if applicable)
+
+# On a DataNode host
+jps
+# Expected output includes: DataNode
+
+# On the ResourceManager host
+jps
+# Expected output includes: ResourceManager
+
+# On a NodeManager host
+jps
+# Expected output includes: NodeManager
+```
+
+<Warning>
+`jps` only reports processes visible to the current user. Run it as the `hadoop` service user if daemons were started under that account.
+</Warning>
+
+## Web UIs
+
+Each Hadoop daemon exposes a built-in web interface for real-time monitoring. No additional software is required—open these URLs in a browser from any host that can reach the cluster network.
+
+<CardGroup cols={2}>
+  <Card title="NameNode" icon="database">
+    `http://<namenode-host>:9870`
+
+    HDFS overview, live and dead DataNodes, block pool usage, and namespace quota consumption.
+  </Card>
+  <Card title="ResourceManager" icon="server">
+    `http://<resourcemanager-host>:8088`
+
+    YARN cluster capacity, running and completed applications, and queue utilization.
+  </Card>
+  <Card title="NodeManager" icon="cpu">
+    `http://<nodemanager-host>:8042`
+
+    Per-node container list, resource allocation, and local log access.
+  </Card>
+  <Card title="JobHistory Server" icon="clock">
+    `http://<jobhistory-host>:19888`
+
+    Completed MapReduce job details including task counters and logs.
+  </Card>
+</CardGroup>
+
+## Log management
+
+### Log file location
+
+Hadoop daemons write logs to `$HADOOP_LOG_DIR`, which defaults to `$HADOOP_HOME/logs`. Each daemon creates two files:
+
+| File pattern | Purpose |
+|---|---|
+| `hadoop-<user>-<daemon>-<hostname>.log` | Rolling application log (Log4j) |
+| `hadoop-<user>-<daemon>-<hostname>.out` | stdout/stderr captured from daemon startup |
+
+### Adjusting log levels at runtime
+
+You can change the log level of a running daemon without restarting it via its web UI or with `dfsadmin`:
+
+```bash
+# Set the root logger to DEBUG on the NameNode
+hdfs dfsadmin -setLogLevel DEBUG org.apache.hadoop.hdfs.server.namenode.NameNode
+
+# Via the NameNode web UI — navigate to:
+# http://<namenode-host>:9870/logLevel
+```
+
+### Enabling verbose Kerberos / security debug output
+
+```bash
+export HADOOP_OPTS="-Dsun.security.krb5.debug=true $HADOOP_OPTS"
+export HADOOP_ROOT_LOGGER=DEBUG,console
+```
+
+## Cluster health checks
+
+<Steps>
+  <Step title="Check HDFS filesystem consistency">
+    `hdfs fsck` walks the namespace and reports under-replicated, over-replicated, missing, or corrupt blocks.
+
+    ```bash
+    # Full filesystem check (can be slow on large clusters)
+    hdfs fsck /
+
+    # Check a specific directory
+    hdfs fsck /user/hadoop/data -files -blocks -locations
+
+    # Show only problematic files
+    hdfs fsck / -list-corruptfileblocks
+    ```
+  </Step>
+  <Step title="Review HDFS DataNode status">
+    ```bash
+    # Summary of live, dead, and decommissioning DataNodes
+    hdfs dfsadmin -report
+
+    # Show only live DataNodes
+    hdfs dfsadmin -report -live
+    ```
+  </Step>
+  <Step title="List YARN NodeManagers">
+    ```bash
+    # List all registered NodeManagers and their state
+    yarn node -list
+
+    # Show only unhealthy nodes
+    yarn node -list -states UNHEALTHY
+    ```
+  </Step>
+</Steps>
+
+## Adding and removing nodes
+
+### Adding a new DataNode or NodeManager
+
+<Steps>
+  <Step title="Install and configure the new node">
+    Install the same Hadoop version used by the cluster. Copy `core-site.xml`, `hdfs-site.xml`, and `yarn-site.xml` from an existing worker node.
+  </Step>
+  <Step title="Start the daemons">
+    ```bash
+    $HADOOP_HOME/bin/hdfs --daemon start datanode
+    $HADOOP_HOME/bin/yarn --daemon start nodemanager
+    ```
+  </Step>
+  <Step title="Verify registration">
+    ```bash
+    hdfs dfsadmin -report -live
+    yarn node -list
+    ```
+    The new node should appear within a few seconds of starting.
+  </Step>
+</Steps>
+
+### Decommissioning a DataNode
+
+Decommissioning drains blocks from a DataNode before it is removed, preventing data loss.
+
+<Steps>
+  <Step title="Add the node to the exclude list">
+    Edit `$HADOOP_CONF_DIR/dfs.hosts.exclude` and add the DataNode's hostname, one per line.
+
+    ```bash
+    echo "worker-node-07.example.com" >> $HADOOP_CONF_DIR/dfs.hosts.exclude
+    ```
+  </Step>
+  <Step title="Instruct the NameNode to refresh its node list">
+    ```bash
+    hdfs dfsadmin -refreshNodes
+    ```
+  </Step>
+  <Step title="Monitor decommission progress">
+    ```bash
+    hdfs dfsadmin -report -decommissioning
+    ```
+    Wait until the node moves from **Decommission In Progress** to **Decommissioned**.
+  </Step>
+  <Step title="Stop the daemons and remove the hostname">
+    Once decommissioned, stop the DataNode daemon and remove its entry from `dfs.hosts.exclude`. Run `-refreshNodes` again to clean up the NameNode's view.
+  </Step>
+</Steps>
+
+<Note>
+The same pattern applies to NodeManagers: use `yarn.resourcemanager.nodes.exclude-path` in `yarn-site.xml` and run `yarn rmadmin -refreshNodes` after updating the file.
+</Note>
+
+## Rolling upgrades
+
+Rolling upgrades let you upgrade Hadoop with no cluster downtime by upgrading one daemon at a time.
+
+<Steps>
+  <Step title="Prepare the upgrade on the NameNode">
+    ```bash
+    hdfs dfsadmin -rollingUpgrade prepare
+    ```
+    This checkpoints the namespace so a rollback image is available. Monitor with:
+
+    ```bash
+    hdfs dfsadmin -rollingUpgrade query
+    ```
+
+    Wait until the output shows `Proceed with rolling upgrade`.
+  </Step>
+  <Step title="Upgrade DataNodes one at a time">
+    On each DataNode host, stop the old daemon, install the new binaries, and restart:
+
+    ```bash
+    $HADOOP_HOME/bin/hdfs --daemon stop datanode
+    # ... install new Hadoop version ...
+    $HADOOP_HOME/bin/hdfs --daemon start datanode
+    ```
+  </Step>
+  <Step title="Upgrade the NameNode">
+    Once all DataNodes are on the new version, upgrade the NameNode binary and restart it.
+  </Step>
+  <Step title="Finalize the upgrade">
+    ```bash
+    hdfs dfsadmin -rollingUpgrade finalize
+    ```
+    This removes the rollback image. After finalizing, downgrade is no longer possible.
+  </Step>
+</Steps>
+
+<Warning>
+Do not finalize until you have confirmed the cluster is stable on the new version. Finalization is irreversible.
+</Warning>
+
+## Common troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Connection refused when contacting the NameNode">
+    - Verify the NameNode process is running with `jps` on the NameNode host.
+    - Check `$HADOOP_LOG_DIR/hadoop-*-namenode-*.log` for startup errors.
+    - Confirm `fs.defaultFS` in `core-site.xml` matches the NameNode hostname and port.
+    - Ensure no firewall is blocking port 8020 (IPC) or 9870 (HTTP).
+  </Accordion>
+  <Accordion title="DataNode reports out of disk space">
+    - Check available disk space on DataNode volumes: `df -h`.
+    - Review `dfs.datanode.data.dir` in `hdfs-site.xml` to confirm which directories are configured.
+    - Run the HDFS balancer to redistribute blocks: `hdfs balancer -threshold 10`.
+    - Consider adding new disks or decommissioning the node and provisioning a larger one.
+  </Accordion>
+  <Accordion title="NameNode is in safe mode">
+    Safe mode is entered automatically at startup while the NameNode waits to receive block reports from DataNodes. It exits automatically once the configured threshold of blocks is reported.
+
+    ```bash
+    # Check safe mode status
+    hdfs dfsadmin -safemode get
+
+    # Force exit from safe mode (use with caution)
+    hdfs dfsadmin -safemode leave
+    ```
+
+    If the cluster is stuck in safe mode after startup, check how many DataNodes have registered: `hdfs dfsadmin -report`.
+  </Accordion>
+  <Accordion title="ResourceManager shows no NodeManagers">
+    - Verify NodeManagers are running on worker nodes with `jps`.
+    - Ensure `yarn.resourcemanager.hostname` or `yarn.resourcemanager.address` in `yarn-site.xml` points to the correct host.
+    - Check NodeManager logs at `$HADOOP_LOG_DIR/yarn-*-nodemanager-*.log` for registration errors.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,269 @@
+---
+title: "Hadoop service-level authorization with hadoop-policy.xml"
+description: "Control which users and groups can call Hadoop RPC services using hadoop-policy.xml. Covers protocol ACL syntax, refreshing policies, and web UI access."
+---
+
+Hadoop service-level authorization is a coarse-grained access control layer that sits in front of every RPC service. Before any protocol method is invoked, the `ServiceAuthorizationManager` checks whether the connecting user appears in the ACL configured for that protocol. This check happens before filesystem permissions are evaluated—a user denied at the service level cannot even establish a connection, regardless of what HDFS ACLs would subsequently permit.
+
+Service-level authorization is distinct from HDFS filesystem permissions and YARN queue ACLs. It answers the question "which users may call this RPC service at all?" rather than "which files may this user read?"
+
+## Enabling service-level authorization
+
+Set the following property in `core-site.xml` on every cluster node:
+
+```xml
+<!-- core-site.xml -->
+<property>
+  <name>hadoop.security.authorization</name>
+  <value>true</value>
+</property>
+```
+
+<Note>
+This setting must be in place before daemons start. It is safe to set it cluster-wide in all environments, even those without Kerberos. Without Kerberos, the username used for ACL evaluation is the OS user reported by the client, which can be spoofed.
+</Note>
+
+## hadoop-policy.xml
+
+`hadoop-policy.xml` is the configuration file that maps each Hadoop RPC protocol to an ACL. It must be present in `$HADOOP_CONF_DIR` on every host that runs a daemon subject to service authorization.
+
+### ACL syntax
+
+Each ACL value is a string with the format:
+
+```
+user1,user2[whitespace]group1,group2
+```
+
+- Users and groups are separated by a single space.
+- Use `*` to permit all users and groups (wildcard).
+- An empty string `""` denies everyone.
+- Omit the user or group portion if only one side is needed (e.g., ` hadoop-admins` for a groups-only ACL, note the leading space).
+
+### Common protocol ACLs
+
+```xml
+<!-- hadoop-policy.xml -->
+<configuration>
+
+  <!-- Controls access to the NameNode RPC service (ClientProtocol) -->
+  <property>
+    <name>security.client.protocol.acl</name>
+    <value>*</value>
+    <description>All users may call the NameNode client protocol (standard).</description>
+  </property>
+
+  <!-- Controls access from DataNodes to the NameNode (DatanodeProtocol) -->
+  <property>
+    <name>security.datanode.protocol.acl</name>
+    <value>hdfs</value>
+    <description>Only the hdfs service account may register as a DataNode.</description>
+  </property>
+
+  <!-- Controls access to the NameNode inter-NameNode protocol (NamenodeProtocol) -->
+  <property>
+    <name>security.namenode.protocol.acl</name>
+    <value>hdfs</value>
+  </property>
+
+  <!-- Controls access to the JobTracker / ResourceManager client protocol -->
+  <property>
+    <name>security.job.client.protocol.acl</name>
+    <value>* </value>
+    <description>All users; the trailing space indicates no group restriction.</description>
+  </property>
+
+  <!-- Controls inter-NodeManager communication -->
+  <property>
+    <name>security.inter.datanode.protocol.acl</name>
+    <value>hdfs</value>
+  </property>
+
+  <!-- Controls who can administer the cluster via dfsadmin / rmadmin -->
+  <property>
+    <name>security.admin.operations.protocol.acl</name>
+    <value>hadoop-admins</value>
+    <description>Only members of the hadoop-admins group may call admin RPCs.</description>
+  </property>
+
+  <!-- Controls the refresh authorization policy protocol -->
+  <property>
+    <name>security.refresh.policy.protocol.acl</name>
+    <value>hadoop-admins</value>
+  </property>
+
+  <!-- Controls user-to-group mapping refresh -->
+  <property>
+    <name>security.refresh.user.mappings.protocol.acl</name>
+    <value>hadoop-admins</value>
+  </property>
+
+  <!-- Controls the generic refresh protocol -->
+  <property>
+    <name>security.refresh.generic.protocol.acl</name>
+    <value>hadoop-admins</value>
+  </property>
+
+</configuration>
+```
+
+### Blocking specific users or groups
+
+Each ACL key supports a corresponding `.blocked` suffix to explicitly deny a user or group even if they would otherwise be permitted by the main ACL:
+
+```xml
+<!-- Deny the "restricted-svc" user from calling the client protocol,
+     even though the main ACL is set to * -->
+<property>
+  <name>security.client.protocol.acl.blocked</name>
+  <value>restricted-svc</value>
+</property>
+```
+
+The `ServiceAuthorizationManager.authorize` method in `ServiceAuthorizationManager.java` evaluates `acls[0]` (allowed) and `acls[1]` (blocked) in sequence. A user must be in the allowed ACL and must **not** be in the blocked ACL.
+
+## Refreshing policies without restart
+
+After editing `hadoop-policy.xml`, apply changes to running daemons without a restart:
+
+```bash
+# Refresh NameNode service ACLs
+hdfs dfsadmin -refreshServiceAcl
+
+# Refresh ResourceManager service ACLs
+yarn rmadmin -refreshServiceAcl
+```
+
+<Tip>
+`-refreshServiceAcl` reads the `hadoop.policy.file` system property (defaults to `hadoop-policy.xml`) to locate the policy file. You can override this at daemon startup time with `-Dhadoop.policy.file=custom-policy.xml`.
+</Tip>
+
+The refresh operation calls `ServiceAuthorizationManager.refresh`, which re-reads the policy file and atomically swaps in the new ACL map. In-flight RPCs are not affected.
+
+## Differences from filesystem permissions
+
+It is important to understand where service-level authorization fits in the broader security stack:
+
+<CardGroup cols={2}>
+  <Card title="Service-level ACLs" icon="shield-check">
+    Defined in `hadoop-policy.xml`. Controls which users can connect to an RPC endpoint at all. Evaluated first, before any filesystem operation. Applies to daemon-to-daemon and client-to-daemon communication.
+  </Card>
+  <Card title="HDFS filesystem permissions" icon="folder-lock">
+    Defined per file and directory in the HDFS namespace. Controls read, write, and execute access to specific paths. Evaluated after the client has already connected to the NameNode.
+  </Card>
+  <Card title="HDFS POSIX ACLs" icon="list-check">
+    Extended access control entries (`hdfs dfs -setfacl`) providing fine-grained per-user/per-group permissions beyond the standard owner/group/other model. Also evaluated at the filesystem level, not the service level.
+  </Card>
+  <Card title="YARN queue ACLs" icon="layout-list">
+    Defined in the scheduler configuration (`capacity-scheduler.xml`). Controls which users may submit applications to or administer specific queues. Separate from both service-level and filesystem authorization.
+  </Card>
+</CardGroup>
+
+## Web UI authorization
+
+Hadoop web UIs have their own authorization layer, separate from the RPC service ACLs.
+
+### HDFS NameNode web UI
+
+```xml
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.cluster.administrators</name>
+  <value>hadoop-admins</value>
+  <description>
+    Users and groups who may access privileged NameNode web UI pages
+    such as /dfshealth.html and /conf. Accepts the same
+    user group whitespace syntax as hadoop-policy.xml.
+  </description>
+</property>
+```
+
+### YARN ResourceManager web UI
+
+```xml
+<!-- yarn-site.xml -->
+<property>
+  <name>yarn.admin.acl</name>
+  <value>yarn-admin hadoop-admins</value>
+  <description>
+    Users (before the space) and groups (after the space) who may
+    perform administrative actions via the ResourceManager web UI
+    and REST API, such as killing applications and modifying queues.
+  </description>
+</property>
+```
+
+<Warning>
+`dfs.cluster.administrators` and `yarn.admin.acl` control administrative web UI access only. They do not restrict the RPC service protocols—use `hadoop-policy.xml` for protocol-level control.
+</Warning>
+
+## Full example: locked-down cluster policy
+
+The following `hadoop-policy.xml` shows a conservative policy for a production cluster where only specific service accounts and admin groups have access, and all other users are restricted to the client-facing protocols:
+
+```xml
+<configuration>
+
+  <!-- Allow all authenticated users to use the HDFS client protocol -->
+  <property>
+    <name>security.client.protocol.acl</name>
+    <value>*</value>
+  </property>
+
+  <!-- Only the hdfs service account may act as a DataNode -->
+  <property>
+    <name>security.datanode.protocol.acl</name>
+    <value>hdfs</value>
+  </property>
+
+  <!-- Only hdfs may talk namenode-to-namenode (Secondary NN, HA standby) -->
+  <property>
+    <name>security.namenode.protocol.acl</name>
+    <value>hdfs</value>
+  </property>
+
+  <!-- Allow all authenticated users to submit YARN applications -->
+  <property>
+    <name>security.job.client.protocol.acl</name>
+    <value>*</value>
+  </property>
+
+  <!-- Only yarn service account and task containers use task umbilical -->
+  <property>
+    <name>security.task.umbilical.protocol.acl</name>
+    <value>yarn</value>
+  </property>
+
+  <!-- Restrict admin operations to the cluster-admins group -->
+  <property>
+    <name>security.admin.operations.protocol.acl</name>
+    <value> cluster-admins</value>
+  </property>
+
+  <!-- Restrict policy refresh to cluster-admins -->
+  <property>
+    <name>security.refresh.policy.protocol.acl</name>
+    <value> cluster-admins</value>
+  </property>
+
+  <!-- Restrict user mapping refresh to cluster-admins -->
+  <property>
+    <name>security.refresh.user.mappings.protocol.acl</name>
+    <value> cluster-admins</value>
+  </property>
+
+  <!-- Block a known compromised service account from all client operations -->
+  <property>
+    <name>security.client.protocol.acl.blocked</name>
+    <value>compromised-svc</value>
+  </property>
+
+</configuration>
+```
+
+After deploying this file, apply it:
+
+```bash
+hdfs dfsadmin -refreshServiceAcl
+yarn rmadmin -refreshServiceAcl
+```

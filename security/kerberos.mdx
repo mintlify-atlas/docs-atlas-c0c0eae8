@@ -1,0 +1,300 @@
+---
+title: "Kerberos authentication for Hadoop clusters"
+description: "Configure Kerberos authentication for HDFS, YARN, and MapReduce. Covers service principals, keytabs, core-site.xml setup, and delegation tokens."
+---
+
+Hadoop's strong authentication mode relies on Kerberos, a widely deployed network authentication protocol that uses time-limited tickets issued by a trusted Key Distribution Center (KDC). When Kerberos is enabled, every Hadoop RPC call is authenticated end-to-end: DataNodes verify that NameNode requests come from a legitimate principal, and user jobs cannot impersonate one another. Without Kerberos, Hadoop trusts the username reported by the client—providing no protection against spoofing on a shared network.
+
+## Prerequisites
+
+Before configuring Hadoop, ensure the following are in place:
+
+<CardGroup cols={2}>
+  <Card title="Working KDC" icon="shield">
+    MIT Kerberos 5 (`krb5-server`) or an Active Directory domain with Kerberos enabled. Every cluster node must be able to reach the KDC on UDP/TCP port 88.
+  </Card>
+  <Card title="Clock synchronization" icon="clock">
+    Kerberos tickets include timestamps. All cluster nodes must have their clocks synchronized to within the KDC's `clockskew` tolerance (5 minutes by default). Use NTP or chrony.
+  </Card>
+  <Card title="DNS resolution" icon="globe">
+    Hadoop constructs Kerberos principal names using the FQDN of each host. Forward and reverse DNS must be consistent across all nodes.
+  </Card>
+  <Card title="krb5.conf distributed" icon="file">
+    `/etc/krb5.conf` (or the equivalent) must be present and point to the correct KDC on every cluster node, including the node where users submit jobs.
+  </Card>
+</CardGroup>
+
+## Service principals
+
+Each Hadoop daemon requires its own Kerberos principal. The `_HOST` token in a principal name is replaced at runtime by the daemon's fully qualified hostname, allowing a single keytab to serve any machine.
+
+| Daemon | Principal pattern |
+|---|---|
+| NameNode | `hdfs/_HOST@REALM` |
+| DataNode | `hdfs/_HOST@REALM` |
+| Secondary NameNode | `hdfs/_HOST@REALM` |
+| ResourceManager | `yarn/_HOST@REALM` |
+| NodeManager | `yarn/_HOST@REALM` |
+| JobHistory Server | `mapred/_HOST@REALM` |
+| HTTP / SPNEGO | `HTTP/_HOST@REALM` |
+
+The `HTTP/_HOST@REALM` principal enables SPNEGO-based Kerberos authentication for the Hadoop web UIs.
+
+## Creating principals and keytabs
+
+<Steps>
+  <Step title="Open the kadmin shell on the KDC">
+    ```bash
+    sudo kadmin.local
+    ```
+    Use `kadmin.local` (no network required) if you are logged in to the KDC host directly, or `kadmin -p admin/admin@REALM` remotely.
+  </Step>
+  <Step title="Create service principals">
+    ```bash
+    # Inside kadmin
+    addprinc -randkey hdfs/namenode.example.com@EXAMPLE.COM
+    addprinc -randkey hdfs/datanode-01.example.com@EXAMPLE.COM
+    addprinc -randkey yarn/resourcemanager.example.com@EXAMPLE.COM
+    addprinc -randkey yarn/nodemanager-01.example.com@EXAMPLE.COM
+    addprinc -randkey mapred/jobhistory.example.com@EXAMPLE.COM
+    addprinc -randkey HTTP/namenode.example.com@EXAMPLE.COM
+    addprinc -randkey HTTP/resourcemanager.example.com@EXAMPLE.COM
+    ```
+  </Step>
+  <Step title="Export keytab files">
+    ```bash
+    # Still inside kadmin
+    ktadd -k /tmp/hdfs.keytab hdfs/namenode.example.com@EXAMPLE.COM
+    ktadd -k /tmp/hdfs.keytab HTTP/namenode.example.com@EXAMPLE.COM
+
+    ktadd -k /tmp/yarn.keytab yarn/resourcemanager.example.com@EXAMPLE.COM
+    ktadd -k /tmp/yarn.keytab HTTP/resourcemanager.example.com@EXAMPLE.COM
+
+    ktadd -k /tmp/mapred.keytab mapred/jobhistory.example.com@EXAMPLE.COM
+    quit
+    ```
+  </Step>
+  <Step title="Distribute keytabs to cluster nodes">
+    Copy each keytab to the appropriate host, ensuring the file is owned by the Hadoop service user and is not world-readable:
+
+    ```bash
+    scp /tmp/hdfs.keytab namenode.example.com:/etc/security/keytabs/hdfs.keytab
+    ssh namenode.example.com "chown hdfs:hadoop /etc/security/keytabs/hdfs.keytab && chmod 400 /etc/security/keytabs/hdfs.keytab"
+    ```
+  </Step>
+</Steps>
+
+## Core Hadoop configuration
+
+### core-site.xml
+
+```xml
+<configuration>
+  <!-- Enable Kerberos authentication for all RPCs -->
+  <property>
+    <name>hadoop.security.authentication</name>
+    <value>kerberos</value>
+  </property>
+
+  <!-- Enable service-level authorization (uses hadoop-policy.xml) -->
+  <property>
+    <name>hadoop.security.authorization</name>
+    <value>true</value>
+  </property>
+</configuration>
+```
+
+### hdfs-site.xml
+
+```xml
+<configuration>
+  <!-- Enable block access tokens to prevent unauthorized block reads -->
+  <property>
+    <name>dfs.block.access.token.enable</name>
+    <value>true</value>
+  </property>
+
+  <!-- NameNode principal (use _HOST for hostname substitution) -->
+  <property>
+    <name>dfs.namenode.kerberos.principal</name>
+    <value>hdfs/_HOST@EXAMPLE.COM</value>
+  </property>
+  <property>
+    <name>dfs.namenode.keytab.file</name>
+    <value>/etc/security/keytabs/hdfs.keytab</value>
+  </property>
+
+  <!-- DataNode principal -->
+  <property>
+    <name>dfs.datanode.kerberos.principal</name>
+    <value>hdfs/_HOST@EXAMPLE.COM</value>
+  </property>
+  <property>
+    <name>dfs.datanode.keytab.file</name>
+    <value>/etc/security/keytabs/hdfs.keytab</value>
+  </property>
+
+  <!-- SPNEGO principal for the NameNode web UI -->
+  <property>
+    <name>dfs.namenode.kerberos.internal.spnego.principal</name>
+    <value>HTTP/_HOST@EXAMPLE.COM</value>
+  </property>
+
+  <!-- Require DataNodes to prove their identity before serving blocks -->
+  <property>
+    <name>dfs.data.transfer.protection</name>
+    <value>integrity</value>
+  </property>
+</configuration>
+```
+
+### yarn-site.xml
+
+```xml
+<configuration>
+  <!-- ResourceManager principal -->
+  <property>
+    <name>yarn.resourcemanager.principal</name>
+    <value>yarn/_HOST@EXAMPLE.COM</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.keytab</name>
+    <value>/etc/security/keytabs/yarn.keytab</value>
+  </property>
+
+  <!-- NodeManager principal -->
+  <property>
+    <name>yarn.nodemanager.principal</name>
+    <value>yarn/_HOST@EXAMPLE.COM</value>
+  </property>
+  <property>
+    <name>yarn.nodemanager.keytab</name>
+    <value>/etc/security/keytabs/yarn.keytab</value>
+  </property>
+</configuration>
+```
+
+## User authentication
+
+### Obtaining and managing tickets
+
+```bash
+# Log in and obtain a Kerberos ticket-granting ticket
+kinit alice@EXAMPLE.COM
+
+# Log in using a keytab (non-interactive, useful for scheduled jobs)
+kinit -kt /home/alice/alice.keytab alice@EXAMPLE.COM
+
+# Inspect your current tickets
+klist
+
+# Destroy all tickets (log out)
+kdestroy
+
+# Renew a ticket before it expires
+kinit -R
+```
+
+<Tip>
+Use `kinit -l 10h -r 7d` to request a 10-hour ticket with a 7-day renewable lifetime for long-running batch workloads.
+</Tip>
+
+### Running Hadoop commands as a Kerberos user
+
+Once you have a valid TGT (`kinit` succeeded), all Hadoop commands issued by that user automatically authenticate using the cached credential:
+
+```bash
+kinit alice@EXAMPLE.COM
+hdfs dfs -ls /user/alice
+yarn application -list
+```
+
+## Delegation tokens
+
+Delegation tokens allow a job to access HDFS on behalf of the submitting user without requiring that user's Kerberos credentials to be present on every NodeManager. The ResourceManager obtains a delegation token from the NameNode at job submission time and distributes it to containers.
+
+```bash
+# Fetch a delegation token and store it in a local file
+hdfs fetchdt --renewer yarn /tmp/alice.token
+
+# View token details
+hdfs fetchdt --print /tmp/alice.token
+
+# Submit a job using a pre-fetched token (the job framework does this automatically)
+export HADOOP_TOKEN_FILE_LOCATION=/tmp/alice.token
+hadoop jar myjob.jar com.example.MyJob
+```
+
+Delegation tokens have a maximum lifetime configured by:
+
+```xml
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.namenode.delegation.token.max-lifetime</name>
+  <value>604800000</value>
+  <description>Maximum lifetime of a delegation token in milliseconds (7 days).</description>
+</property>
+<property>
+  <name>dfs.namenode.delegation.token.renew-interval</name>
+  <value>86400000</value>
+  <description>How often (ms) a token must be renewed before expiry (1 day).</description>
+</property>
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="KDC is unreachable">
+    - Verify network connectivity: `telnet <kdc-host> 88`.
+    - Check `/etc/krb5.conf` on the affected node for the correct `kdc` hostname.
+    - Confirm the KDC service is running: `systemctl status krb5kdc`.
+    - Test directly with `kinit -V alice@EXAMPLE.COM` for verbose output.
+  </Accordion>
+  <Accordion title="Clock skew too great">
+    Kerberos rejects tickets if the client clock differs from the KDC by more than `clockskew` (default 5 minutes):
+
+    ```bash
+    # Check current time vs KDC
+    date
+    ntpdate -q <kdc-host>
+
+    # Sync immediately
+    ntpdate <ntp-server>
+    # or
+    chronyc makestep
+    ```
+  </Accordion>
+  <Accordion title="Wrong principal in keytab">
+    ```bash
+    # List the principals in a keytab
+    klist -kt /etc/security/keytabs/hdfs.keytab
+
+    # Verify that the principal matches what is configured in hdfs-site.xml
+    # The hostname part must match the FQDN of the host exactly
+    hostname -f
+    ```
+
+    If the hostname in the keytab does not match `hostname -f`, regenerate the keytab with the correct FQDN.
+  </Accordion>
+  <Accordion title="GSS initiate failed / No valid credentials">
+    - Run `kdestroy` and `kinit` again—your ticket may have expired.
+    - If using a keytab, confirm the file exists and is readable by the service user: `ls -la /etc/security/keytabs/`.
+    - Enable Kerberos debug output to get detailed error messages:
+
+    ```bash
+    export HADOOP_OPTS="-Dsun.security.krb5.debug=true $HADOOP_OPTS"
+    hdfs dfs -ls /
+    ```
+  </Accordion>
+  <Accordion title="Running KDiag for diagnostics">
+    Hadoop ships the `KDiag` tool (`hadoop kdiag`) to run a comprehensive Kerberos environment check:
+
+    ```bash
+    hadoop kdiag \
+      --keytab /etc/security/keytabs/hdfs.keytab \
+      --principal hdfs/namenode.example.com@EXAMPLE.COM
+    ```
+
+    `KDiag` verifies Java Cryptography Extension strength, ticket validity, and DNS resolution in a single pass. The source is in `KDiag.java` in `hadoop-common`.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,240 @@
+---
+title: 'Hadoop FileSystem API: reading and writing data'
+description: 'A guide to the FileSystem abstract class, FileContext, FSDataInputStream, FSDataOutputStream, and PathCapabilities for reading and writing data in Hadoop.'
+---
+
+The `FileSystem` abstract class (`org.apache.hadoop.fs.FileSystem`) is Hadoop's core interface for interacting with any storage backend — HDFS, the local filesystem, Amazon S3 via the `s3a://` connector, Azure Data Lake Storage, Google Cloud Storage, and more. Client code that writes to `FileSystem` works across all of these backends without modification. The class is annotated `@InterfaceAudience.Public` and `@InterfaceStability.Stable`, meaning its contract is guaranteed across minor releases. Its successor, `FileContext`, offers a cleaner, thread-safe alternative for new code that avoids the static state problems of `FileSystem`.
+
+## Getting a FileSystem instance
+
+You never instantiate `FileSystem` directly. Obtain an instance from the static factory methods, which look up the scheme in the `Configuration` and load the appropriate implementation:
+
+```java
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import java.net.URI;
+
+// Use the default filesystem from fs.defaultFS in core-site.xml
+Configuration conf = new Configuration();
+FileSystem fs = FileSystem.get(conf);
+
+// Use a specific URI regardless of defaults
+FileSystem hdfs = FileSystem.get(URI.create("hdfs://namenode:8020"), conf);
+
+// Obtain the local filesystem
+FileSystem local = FileSystem.getLocal(conf);
+```
+
+<Note>
+  `FileSystem.get()` returns a shared, cached instance keyed by (URI scheme+authority, user). Call `fs.close()` only when you own the instance exclusively, or use `FileSystem.newInstance()` to obtain a non-cached instance that is safe to close independently.
+</Note>
+
+## The Path class
+
+`Path` represents a file or directory location. It wraps a URI and provides scheme-aware manipulation:
+
+```java
+// Absolute path on the default filesystem
+Path p1 = new Path("/user/alice/data");
+
+// Fully qualified path
+Path p2 = new Path("hdfs://namenode:8020/user/alice/data");
+
+// Resolve a child path
+Path child = new Path(p1, "part-r-00000");
+
+// Convert to URI
+URI uri = p2.toUri(); // hdfs://namenode:8020/user/alice/data
+```
+
+Paths starting with a scheme prefix (`hdfs://`, `s3a://`, `file://`) are fully qualified and bypass the default filesystem setting.
+
+## Core FileSystem methods
+
+<AccordionGroup>
+  <Accordion title="Reading files">
+    ```java
+    // Open a file for reading — returns FSDataInputStream
+    FSDataInputStream in = fs.open(new Path("/data/input.txt"));
+
+    // Read all bytes (for small files)
+    byte[] buf = new byte[1024];
+    int n = in.read(buf);
+    in.close();
+
+    // Wrap in BufferedReader for line-oriented access
+    try (BufferedReader br = new BufferedReader(new InputStreamReader(in))) {
+      String line;
+      while ((line = br.readLine()) != null) {
+        System.out.println(line);
+      }
+    }
+    ```
+
+    `FSDataInputStream` extends `java.io.DataInputStream` and also implements `Seekable` and `PositionedReadable`, so you can seek to any offset or issue positional reads for random access.
+  </Accordion>
+  <Accordion title="Writing files">
+    ```java
+    // Create a new file (overwrites if exists)
+    FSDataOutputStream out = fs.create(new Path("/data/output.txt"));
+    out.writeUTF("Hello, Hadoop!\n");
+    out.close();
+
+    // Create with replication factor and block size
+    short replication = 3;
+    long blockSize = 128 * 1024 * 1024; // 128 MB
+    FSDataOutputStream out2 = fs.create(
+        new Path("/data/output2.txt"),
+        true,          // overwrite
+        4096,          // buffer size
+        replication,
+        blockSize
+    );
+    out2.hflush(); // flush to all replicas
+    out2.close();
+
+    // Append to an existing file (not all implementations support this)
+    FSDataOutputStream appended = fs.append(new Path("/data/log.txt"));
+    appended.writeBytes("new line\n");
+    appended.close();
+    ```
+  </Accordion>
+  <Accordion title="Directory and metadata operations">
+    ```java
+    Path dir = new Path("/user/alice");
+
+    // Create directories (like mkdir -p)
+    fs.mkdirs(dir);
+
+    // Check existence
+    boolean exists = fs.exists(dir);
+
+    // List directory contents
+    FileStatus[] statuses = fs.listStatus(dir);
+    for (FileStatus status : statuses) {
+      System.out.println(status.getPath() + " " + status.getLen());
+    }
+
+    // Rename (also used as an atomic move)
+    fs.rename(new Path("/tmp/staging"), new Path("/data/final"));
+
+    // Delete (recursive for directories)
+    fs.delete(new Path("/tmp/old"), true /* recursive */);
+
+    // Get file status for a single path
+    FileStatus status = fs.getFileStatus(new Path("/data/input.txt"));
+    long len    = status.getLen();
+    boolean dir = status.isDirectory();
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## FSDataInputStream and FSDataOutputStream
+
+`FSDataInputStream` and `FSDataOutputStream` are the typed stream classes returned by `FileSystem.open()` and `FileSystem.create()`. They extend the Java standard stream types and add Hadoop-specific capabilities:
+
+| Feature | FSDataInputStream | FSDataOutputStream |
+|---|---|---|
+| Base class | `DataInputStream` | `DataOutputStream` |
+| Random access | `seek(long pos)`, `getPos()` | — |
+| Positional read | `read(long pos, byte[] buf, ...)` | — |
+| Durability flush | — | `hflush()` (to all replicas) |
+| Sync to disk | — | `hsync()` (guarantees disk write) |
+
+<Warning>
+  Not all filesystems support `append()` or positional writes. HDFS supports `append()` only when `dfs.support.append` is enabled. Object stores such as `s3a://` do not support seeking on output streams or true append semantics.
+</Warning>
+
+## FileContext
+
+`FileContext` (`org.apache.hadoop.fs.FileContext`) is a newer alternative to `FileSystem` with a cleaner design:
+
+- **No static state** — each `FileContext` instance is independent, making it safe for concurrent use across threads.
+- **Working directory per instance** — relative paths are resolved against the instance's working directory, not a global setting.
+- **Consistent API** — method signatures are more uniform across filesystem implementations.
+
+```java
+import org.apache.hadoop.fs.FileContext;
+
+// Get FileContext for the default filesystem
+FileContext fc = FileContext.getFileContext(conf);
+
+// Get FileContext for a specific URI
+FileContext hdfsfc = FileContext.getFileContext(
+    URI.create("hdfs://namenode:8020"), conf);
+
+// Use the same open/create/delete methods
+FSDataInputStream in = fc.open(new Path("/data/file.txt"));
+```
+
+<Tip>
+  Prefer `FileContext` for new library code and services that handle paths from multiple filesystems. Use `FileSystem` when integrating with existing MapReduce or Spark code that already uses `FileSystem`.
+</Tip>
+
+## AbstractFileSystem
+
+To implement a custom filesystem backend, extend `AbstractFileSystem` (`org.apache.hadoop.fs.AbstractFileSystem`) rather than `FileSystem`. `AbstractFileSystem` is the backend used by `FileContext` and has a cleaner contract. Register your implementation by setting the configuration key `fs.AbstractFileSystem.<scheme>.impl` to your class name.
+
+## PathCapabilities
+
+`PathCapabilities` allows client code to probe whether a given path (and the filesystem serving it) supports a specific feature at runtime, without needing to know the concrete filesystem class:
+
+```java
+import org.apache.hadoop.fs.PathCapabilities;
+
+// FileSystem implements PathCapabilities
+FileSystem fs = FileSystem.get(conf);
+Path p = new Path("s3a://my-bucket/data");
+
+if (fs.hasPathCapability(p, "fs.s3a.capability.select.sql")) {
+  // S3 Select is available
+}
+
+// Standard capabilities defined in CommonPathCapabilities:
+boolean supportsAppend = fs.hasPathCapability(p, "fs.capability.append");
+boolean supportsACLs   = fs.hasPathCapability(p, "fs.capability.acls");
+```
+
+Standard capability names are defined as constants in `org.apache.hadoop.fs.CommonPathCapabilities`. Always probe capabilities at runtime rather than casting to a concrete class, to keep your code portable across filesystem implementations.
+
+## Complete file read/write example
+
+```java FileSystemExample.java
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+
+public class FileSystemExample {
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    FileSystem fs = FileSystem.get(conf);
+
+    Path outputPath = new Path("/tmp/hello.txt");
+
+    // Write
+    try (FSDataOutputStream out = fs.create(outputPath, true)) {
+      out.writeBytes("Hello from Hadoop FileSystem API\n");
+      out.writeBytes("Second line\n");
+    }
+
+    // Read back
+    try (FSDataInputStream in = fs.open(outputPath);
+         BufferedReader reader = new BufferedReader(new InputStreamReader(in))) {
+      String line;
+      while ((line = reader.readLine()) != null) {
+        System.out.println(line);
+      }
+    }
+
+    // Clean up
+    fs.delete(outputPath, false);
+    fs.close();
+  }
+}
+```

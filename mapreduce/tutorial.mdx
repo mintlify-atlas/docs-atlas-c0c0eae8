@@ -1,0 +1,281 @@
+---
+title: 'MapReduce tutorial: build and run WordCount'
+description: 'Step-by-step guide to writing, compiling, packaging, and running the canonical Hadoop WordCount MapReduce job using the new mapreduce API on YARN.'
+---
+
+WordCount is the canonical MapReduce example: it counts how many times each word appears across a set of text files. The program is simple enough to read in minutes yet illustrates every fundamental concept — input splits, the Mapper, the Combiner, the Reducer, and job submission. This tutorial walks you through the full source code included in the `hadoop-mapreduce-examples` module, then shows you how to compile, package, upload data, and run the job on a live cluster.
+
+## Prerequisites
+
+- A running Hadoop cluster (or pseudo-distributed mode) with HDFS and YARN
+- Java 17 JDK and Maven on the build machine
+- The `hadoop` command on your `PATH` and `HADOOP_HOME` set
+
+<Note>
+  If you are using a local pseudo-distributed cluster, start HDFS and YARN with `$HADOOP_HOME/sbin/start-dfs.sh` and `$HADOOP_HOME/sbin/start-yarn.sh` before proceeding.
+</Note>
+
+## The complete WordCount source
+
+The following is the full source of `WordCount.java` from `hadoop-mapreduce-project/hadoop-mapreduce-examples`:
+
+```java WordCount.java
+package org.apache.hadoop.examples;
+
+import java.io.IOException;
+import java.util.StringTokenizer;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+
+public class WordCount {
+
+  public static class TokenizerMapper
+       extends Mapper<Object, Text, Text, IntWritable>{
+
+    private final static IntWritable one = new IntWritable(1);
+    private Text word = new Text();
+
+    public void map(Object key, Text value, Context context
+                    ) throws IOException, InterruptedException {
+      StringTokenizer itr = new StringTokenizer(value.toString());
+      while (itr.hasMoreTokens()) {
+        word.set(itr.nextToken());
+        context.write(word, one);
+      }
+    }
+  }
+
+  public static class IntSumReducer
+       extends Reducer<Text,IntWritable,Text,IntWritable> {
+    private IntWritable result = new IntWritable();
+
+    public void reduce(Text key, Iterable<IntWritable> values,
+                       Context context
+                       ) throws IOException, InterruptedException {
+      int sum = 0;
+      for (IntWritable val : values) {
+        sum += val.get();
+      }
+      result.set(sum);
+      context.write(key, result);
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    String[] otherArgs = new GenericOptionsParser(conf, args).getRemainingArgs();
+    if (otherArgs.length < 2) {
+      System.err.println("Usage: wordcount <in> [<in>...] <out>");
+      System.exit(2);
+    }
+    Job job = Job.getInstance(conf, "word count");
+    job.setJarByClass(WordCount.class);
+    job.setMapperClass(TokenizerMapper.class);
+    job.setCombinerClass(IntSumReducer.class);
+    job.setReducerClass(IntSumReducer.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(IntWritable.class);
+    for (int i = 0; i < otherArgs.length - 1; ++i) {
+      FileInputFormat.addInputPath(job, new Path(otherArgs[i]));
+    }
+    FileOutputFormat.setOutputPath(job,
+      new Path(otherArgs[otherArgs.length - 1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+```
+
+## Code walkthrough
+
+### TokenizerMapper
+
+`TokenizerMapper` extends `Mapper<Object, Text, Text, IntWritable>`. The four type parameters are the input key type, input value type, output key type, and output value type respectively.
+
+The default `TextInputFormat` provides records where the key is the byte offset of the line (`Object`, ignored here) and the value is the line content as a `Text`. Inside `map()`, `StringTokenizer` splits each line on whitespace. For every token the mapper emits `(word, 1)` using `context.write()`.
+
+`IntWritable` and `Text` are Hadoop's serializable wrappers around `int` and `String`. They implement the `Writable` interface, which is required for all MapReduce key and value types.
+
+### IntSumReducer
+
+`IntSumReducer` extends `Reducer<Text, IntWritable, Text, IntWritable>`. After the shuffle and sort, the reducer receives each distinct word paired with an iterable of all the `1` values that mappers emitted for that word. It sums them and emits `(word, totalCount)`.
+
+Notice that `IntSumReducer` is used as **both** the combiner and the reducer. This is valid because integer addition is commutative and associative: combining partial sums on each mapper node produces the same final result as combining everything in the reducer.
+
+### main method
+
+The `main` method:
+
+1. Creates a `Configuration` and uses `GenericOptionsParser` to strip standard Hadoop flags (like `-D`) from `args`, leaving only the user-supplied paths.
+2. Calls `Job.getInstance(conf, "word count")` to create a new job.
+3. Registers the mapper, combiner, reducer, and output types.
+4. Sets input and output paths from the remaining arguments.
+5. Calls `job.waitForCompletion(true)`, which submits the job, streams progress to stdout, and blocks until the job finishes.
+
+## Tutorial: running WordCount
+
+<Steps>
+  <Step title="Build the examples JAR">
+    Check out the Hadoop source and build the examples module:
+
+    ```bash
+    git clone https://github.com/apache/hadoop.git
+    cd hadoop
+    mvn package -pl hadoop-mapreduce-project/hadoop-mapreduce-examples \
+        -am -DskipTests -Pdist
+    ```
+
+    The resulting JAR is at:
+
+    ```
+    hadoop-mapreduce-project/hadoop-mapreduce-examples/target/
+      hadoop-mapreduce-examples-*.jar
+    ```
+
+    If you are using a pre-built Hadoop distribution, the JAR is already present at `$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-*.jar`.
+  </Step>
+
+  <Step title="Create input data in HDFS">
+    Create the input directory and upload a sample file:
+
+    ```bash
+    hadoop fs -mkdir -p /input
+    echo "hello world hello hadoop world hadoop hadoop" | \
+        hadoop fs -put - /input/test.txt
+    ```
+
+    Verify the file was written:
+
+    ```bash
+    hadoop fs -cat /input/test.txt
+    ```
+  </Step>
+
+  <Step title="Submit the job">
+    Run WordCount against the input directory, writing results to `/output`:
+
+    ```bash
+    hadoop jar $HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-*.jar \
+        wordcount /input /output
+    ```
+
+    <Warning>
+      The output directory must not already exist. Delete it first if you are re-running: `hadoop fs -rm -r /output`
+    </Warning>
+
+    You will see progress lines similar to:
+
+    ```
+    24/01/15 10:23:01 INFO mapreduce.Job: Running job: job_1705312900000_0001
+    24/01/15 10:23:08 INFO mapreduce.Job: map 0% reduce 0%
+    24/01/15 10:23:14 INFO mapreduce.Job: map 100% reduce 0%
+    24/01/15 10:23:20 INFO mapreduce.Job: map 100% reduce 100%
+    24/01/15 10:23:21 INFO mapreduce.Job: Job job_1705312900000_0001 completed successfully
+    ```
+  </Step>
+
+  <Step title="Monitor in the YARN web UI">
+    Open the ResourceManager web UI (default: `http://<resourcemanager>:8088`). Under **Applications**, find your job by name ("word count"). Click through to see container logs, task attempt details, and counter values.
+
+    <Tip>
+      The MapReduce history server at `http://<historyserver>:19888` retains job information after the application completes, including full logs for each task attempt.
+    </Tip>
+  </Step>
+
+  <Step title="View the output">
+    List the output files:
+
+    ```bash
+    hadoop fs -ls /output
+    ```
+
+    Read the result:
+
+    ```bash
+    hadoop fs -cat /output/part-r-00000
+    ```
+
+    Expected output (sorted alphabetically by the framework):
+
+    ```
+    hadoop	3
+    hello	2
+    world	2
+    ```
+  </Step>
+</Steps>
+
+## Writing a custom MapReduce job
+
+Use the following boilerplate as a starting point for your own jobs:
+
+```java CustomJob.java
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
+
+public class CustomJob extends Configured implements Tool {
+
+  @Override
+  public int run(String[] args) throws Exception {
+    if (args.length != 2) {
+      System.err.println("Usage: CustomJob <input> <output>");
+      return 2;
+    }
+
+    Configuration conf = getConf();
+    // Set custom properties before creating the Job
+    conf.setInt("myjob.threshold", 10);
+
+    Job job = Job.getInstance(conf, "custom job");
+    job.setJarByClass(CustomJob.class);
+
+    job.setMapperClass(MyMapper.class);
+    job.setReducerClass(MyReducer.class);
+
+    // Specify output types (must match Reducer output)
+    job.setOutputKeyClass(/* your key type */ null);
+    job.setOutputValueClass(/* your value type */ null);
+
+    // Control the number of reducers
+    job.setNumReduceTasks(4);
+
+    FileInputFormat.addInputPath(job, new Path(args[0]));
+    FileOutputFormat.setOutputPath(job, new Path(args[1]));
+
+    return job.waitForCompletion(true) ? 0 : 1;
+  }
+
+  public static void main(String[] args) throws Exception {
+    System.exit(ToolRunner.run(new CustomJob(), args));
+  }
+}
+```
+
+<Tip>
+  Extend `Configured` and implement `Tool` rather than writing a plain `main` method. `ToolRunner.run()` automatically applies standard Hadoop command-line options such as `-D`, `-conf`, and `-fs` before your code runs.
+</Tip>
+
+## Common configuration properties
+
+| Property | Default | Description |
+|---|---|---|
+| `mapreduce.job.reduces` | `1` | Number of reduce tasks. Set to `0` for a map-only job. |
+| `mapreduce.map.memory.mb` | `1024` | Memory allocated per map container in MB. |
+| `mapreduce.reduce.memory.mb` | `1024` | Memory allocated per reduce container in MB. |
+| `mapreduce.input.fileinputformat.split.maxsize` | None | Maximum split size in bytes; smaller values create more map tasks. |
+| `mapreduce.map.speculative` | `true` | Launch speculative duplicate map tasks for slow stragglers. |
+| `mapreduce.reduce.speculative` | `true` | Launch speculative duplicate reduce tasks for slow stragglers. |

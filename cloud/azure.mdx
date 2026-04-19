@@ -1,0 +1,221 @@
+---
+title: 'Azure Storage with Hadoop (ABFS & WASB)'
+description: 'Connect Hadoop to Azure Data Lake Storage Gen2 via ABFS or Azure Blob Storage via WASB. Covers OAuth2, Managed Identity, and core-site.xml configuration.'
+---
+
+The `hadoop-azure` module provides two connectors for Microsoft Azure storage. The ABFS (Azure Blob File System) connector supports Azure Data Lake Storage Gen2 (ADLS Gen2) via the `abfs://` and `abfss://` URI schemes and is the recommended choice for new deployments. The older WASB connector targets Azure Blob Storage via `wasb://` and `wasbs://` and is considered legacy. Both connectors implement the Hadoop FileSystem API so standard tools work without code changes.
+
+## Adding the hadoop-azure dependency
+
+The connector is included in the `hadoop-azure` module. To build it from source:
+
+```bash
+mvn package -Phadoop-azure-datalake-package -DskipTests
+```
+
+In a pre-built distribution, add `hadoop-azure-<version>.jar` and its dependencies to the classpath:
+
+```bash
+export HADOOP_CLASSPATH=$HADOOP_HOME/share/hadoop/tools/lib/*:$HADOOP_CLASSPATH
+```
+
+## ABFS connector (ADLS Gen2 — recommended)
+
+ADLS Gen2 combines the hierarchical namespace of a filesystem with the scale and cost model of Azure Blob Storage. It supports atomic renames, true directory semantics, and fine-grained ACLs. Use `abfss://` (TLS) for production and `abfs://` only in development.
+
+### URI format
+
+```text
+abfss://<container>@<account>.dfs.core.windows.net/<path>
+```
+
+```bash
+hadoop fs -ls abfss://mycontainer@myaccount.dfs.core.windows.net/data/
+```
+
+### Authentication
+
+<Tabs>
+  <Tab title="OAuth2 (service principal)">
+    Register an Azure AD application and grant it the Storage Blob Data Contributor role on the storage account.
+
+    ```xml core-site.xml
+    <configuration>
+      <property>
+        <name>fs.azure.account.auth.type</name>
+        <value>OAuth</value>
+      </property>
+      <property>
+        <name>fs.azure.account.oauth.provider.type</name>
+        <value>org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider</value>
+      </property>
+      <property>
+        <name>fs.azure.account.oauth2.client.endpoint</name>
+        <value>https://login.microsoftonline.com/YOUR_TENANT_ID/oauth2/token</value>
+      </property>
+      <property>
+        <name>fs.azure.account.oauth2.client.id</name>
+        <value>YOUR_CLIENT_ID</value>
+      </property>
+      <property>
+        <name>fs.azure.account.oauth2.client.secret</name>
+        <value>YOUR_CLIENT_SECRET</value>
+      </property>
+    </configuration>
+    ```
+  </Tab>
+  <Tab title="Managed Identity">
+    When running on an Azure virtual machine or AKS pod with a managed identity assigned, no credentials need to be stored in configuration files.
+
+    ```xml core-site.xml
+    <configuration>
+      <property>
+        <name>fs.azure.account.auth.type</name>
+        <value>OAuth</value>
+      </property>
+      <property>
+        <name>fs.azure.account.oauth.provider.type</name>
+        <value>org.apache.hadoop.fs.azurebfs.oauth2.MsiTokenProvider</value>
+      </property>
+    </configuration>
+    ```
+
+    For user-assigned managed identities, also set:
+
+    ```xml
+    <property>
+      <name>fs.azure.account.oauth2.msi.tenant</name>
+      <value>YOUR_TENANT_ID</value>
+    </property>
+    <property>
+      <name>fs.azure.account.oauth2.client.id</name>
+      <value>YOUR_CLIENT_ID</value>
+    </property>
+    ```
+  </Tab>
+  <Tab title="Shared Key">
+    Authenticate with the storage account's access key. Simple but grants full access to the account.
+
+    ```xml core-site.xml
+    <configuration>
+      <property>
+        <name>fs.azure.account.auth.type</name>
+        <value>SharedKey</value>
+      </property>
+      <property>
+        <name>fs.azure.account.key.myaccount.dfs.core.windows.net</name>
+        <value>YOUR_ACCOUNT_KEY</value>
+      </property>
+    </configuration>
+    ```
+
+    <Warning>
+      Shared Key authentication grants access equivalent to root on the storage account. Prefer OAuth2 with least-privilege service principals in production.
+    </Warning>
+  </Tab>
+  <Tab title="SAS token">
+    Use a shared access signature scoped to a container and set of permissions.
+
+    ```xml core-site.xml
+    <configuration>
+      <property>
+        <name>fs.azure.account.auth.type</name>
+        <value>SAS</value>
+      </property>
+      <property>
+        <name>fs.azure.sas.mycontainer.myaccount.dfs.core.windows.net</name>
+        <value>YOUR_SAS_TOKEN</value>
+      </property>
+    </configuration>
+    ```
+  </Tab>
+</Tabs>
+
+### Reading and writing
+
+```bash
+# List a container
+hadoop fs -ls abfss://mycontainer@myaccount.dfs.core.windows.net/
+
+# Copy from HDFS to ADLS Gen2
+hadoop fs -cp /user/hadoop/data abfss://mycontainer@myaccount.dfs.core.windows.net/data
+
+# Run DistCp
+hadoop distcp \
+  hdfs://nn:9000/data \
+  abfss://mycontainer@myaccount.dfs.core.windows.net/data
+```
+
+## WASB connector (Azure Blob Storage — legacy)
+
+<Note>
+  WASB is maintained for backward compatibility. For new workloads, use the ABFS connector with ADLS Gen2.
+</Note>
+
+WASB connects to Azure Blob Storage using the `wasb://` (unencrypted) or `wasbs://` (TLS) scheme.
+
+### URI format
+
+```text
+wasbs://<container>@<account>.blob.core.windows.net/<path>
+```
+
+### Configuration
+
+```xml core-site.xml
+<configuration>
+  <property>
+    <name>fs.azure.account.key.myaccount.blob.core.windows.net</name>
+    <value>YOUR_ACCOUNT_KEY</value>
+  </property>
+</configuration>
+```
+
+```bash
+hadoop fs -ls wasbs://mycontainer@myaccount.blob.core.windows.net/
+```
+
+## Per-account configuration
+
+Both connectors support per-account configuration by including the account name in the property key. This allows different credentials or auth types for different storage accounts in the same cluster:
+
+```xml core-site.xml
+<configuration>
+  <!-- Account A: service principal -->
+  <property>
+    <name>fs.azure.account.auth.type.accountA.dfs.core.windows.net</name>
+    <value>OAuth</value>
+  </property>
+  <property>
+    <name>fs.azure.account.oauth.provider.type.accountA.dfs.core.windows.net</name>
+    <value>org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider</value>
+  </property>
+
+  <!-- Account B: shared key -->
+  <property>
+    <name>fs.azure.account.auth.type.accountB.dfs.core.windows.net</name>
+    <value>SharedKey</value>
+  </property>
+  <property>
+    <name>fs.azure.account.key.accountB.dfs.core.windows.net</name>
+    <value>ACCOUNT_B_KEY</value>
+  </property>
+</configuration>
+```
+
+## Performance considerations
+
+<CardGroup cols={2}>
+  <Card title="Enable hierarchical namespace" icon="folder-tree">
+    ADLS Gen2 with hierarchical namespace enabled provides atomic renames and true directory operations. Without it, directory renames trigger sequential object copies.
+  </Card>
+  <Card title="Use abfss:// (TLS)" icon="lock">
+    Always prefer `abfss://` over `abfs://` in production to encrypt data in transit.
+  </Card>
+  <Card title="Increase read-ahead buffer" icon="forward">
+    Set `fs.azure.read.request.size` to a larger value (e.g., 8388608) for sequential read workloads.
+  </Card>
+  <Card title="Flush mode for writes" icon="pen">
+    Set `fs.azure.enable.flush` to `true` to ensure data is flushed to Azure on each `hsync()` call, improving durability for streaming writes.
+  </Card>
+</CardGroup>

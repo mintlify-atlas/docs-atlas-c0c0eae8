@@ -1,0 +1,233 @@
+---
+title: 'Hadoop Streaming: Scripts as MapReduce Jobs'
+description: 'Run MapReduce jobs written in any language using stdin and stdout. Covers Python word count, key options, file distribution, and input/output formats.'
+---
+
+Hadoop Streaming is a utility that lets you write MapReduce jobs using any executable or script — Python, Ruby, shell, or any program that reads from standard input and writes to standard output. The framework pipes input records to the mapper's stdin as tab-separated lines and collects whatever the mapper writes to stdout as intermediate key-value pairs. The same convention applies to the reducer. This makes it possible to use existing scripts or domain-specific languages without writing Java.
+
+## How it works
+
+Each input record arrives on stdin as a line of text. The mapper reads it, processes it, and writes one or more `key\tvalue` lines to stdout. Hadoop collects these, sorts and groups by key, then feeds each group to the reducer via stdin. The reducer writes final `key\tvalue` output lines, which become the job's output files.
+
+```
+HDFS input
+    │
+    ▼
+[Mapper stdin] ──► mapper executable ──► stdout [key\tvalue]
+                                                     │
+                                              sort & shuffle
+                                                     │
+[Reducer stdin] ──► reducer executable ──► stdout [key\tvalue]
+                                                     │
+                                                     ▼
+                                              HDFS output
+```
+
+## Basic syntax
+
+```bash
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+  -input  /input/path \
+  -output /output/path \
+  -mapper mapper.py \
+  -reducer reducer.py
+```
+
+<Note>
+  The streaming JAR is located under `share/hadoop/tools/lib/`. The exact filename includes the Hadoop version, for example `hadoop-streaming-3.4.0.jar`.
+</Note>
+
+## Python word count example
+
+<Steps>
+  <Step title="Write the mapper">
+    The mapper emits one `word\t1` pair per word.
+
+    ```python mapper.py
+    #!/usr/bin/env python3
+    import sys
+
+    for line in sys.stdin:
+        line = line.strip()
+        for word in line.split():
+            print(f"{word}\t1")
+    ```
+  </Step>
+
+  <Step title="Write the reducer">
+    The reducer sums counts for each word. Because Hadoop sorts mapper output by key before delivering it to the reducer, all counts for the same word arrive consecutively.
+
+    ```python reducer.py
+    #!/usr/bin/env python3
+    import sys
+
+    current_word = None
+    current_count = 0
+
+    for line in sys.stdin:
+        word, count = line.strip().split('\t', 1)
+        count = int(count)
+        if word == current_word:
+            current_count += count
+        else:
+            if current_word is not None:
+                print(f"{current_word}\t{current_count}")
+            current_word = word
+            current_count = count
+
+    if current_word is not None:
+        print(f"{current_word}\t{current_count}")
+    ```
+  </Step>
+
+  <Step title="Upload scripts and run the job">
+    Use `-files` to distribute the scripts to every node in the cluster before the job starts.
+
+    ```bash
+    hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+      -files mapper.py,reducer.py \
+      -input  /data/text \
+      -output /data/wordcount \
+      -mapper  mapper.py \
+      -reducer reducer.py
+    ```
+  </Step>
+
+  <Step title="Read the output">
+    ```bash
+    hadoop fs -cat /data/wordcount/part-*
+    ```
+  </Step>
+</Steps>
+
+## Key options
+
+<CardGroup cols={2}>
+  <Card title="-input" icon="folder-open">
+    HDFS path (or glob) for input data. Can be specified multiple times to add multiple input paths.
+  </Card>
+  <Card title="-output" icon="folder">
+    HDFS path for output. Must not already exist.
+  </Card>
+  <Card title="-mapper" icon="code">
+    Command or script to use as the mapper. Use `NONE` to skip the map phase and pass input directly to the reducer.
+  </Card>
+  <Card title="-reducer" icon="code">
+    Command or script to use as the reducer. Use `NONE` for a map-only job.
+  </Card>
+  <Card title="-combiner" icon="merge">
+    Optional combiner command run locally on each mapper node to reduce shuffle traffic.
+  </Card>
+  <Card title="-numReduceTasks" icon="hashtag">
+    Number of reduce tasks. Set to `0` for a map-only job with no shuffle phase.
+  </Card>
+</CardGroup>
+
+## Distributing scripts and files
+
+The `-files` option uploads local files to the distributed cache so every task node can access them:
+
+```bash
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+  -files mapper.py,reducer.py,lookup_table.csv \
+  -input  /data/raw \
+  -output /data/processed \
+  -mapper  "python3 mapper.py lookup_table.csv" \
+  -reducer reducer.py
+```
+
+<Tip>
+  When referencing distributed files in your command, use only the filename, not a path. Hadoop places distributed cache files in the task's working directory.
+</Tip>
+
+## Environment variables
+
+Hadoop sets the following environment variables for each task:
+
+| Variable | Description |
+|----------|-------------|
+| `mapreduce_map_input_file` | Path of the input file currently being processed |
+| `mapreduce_task_partition` | Partition number of the current task (0-indexed) |
+| `mapreduce_job_id` | Job ID string |
+| `mapreduce_task_id` | Full task ID string |
+| `mapreduce_task_ismap` | `true` for map tasks, `false` for reduce tasks |
+
+Access them in Python with `os.environ`:
+
+```python
+import os, sys
+
+input_file = os.environ.get('mapreduce_map_input_file', '')
+```
+
+## Input and output formats
+
+By default, streaming uses `TextInputFormat` (one line per record) and `TextOutputFormat`. You can override these with `-inputformat` and `-outputformat`:
+
+<Tabs>
+  <Tab title="KeyValueTextInputFormat">
+    Splits each line at the first tab, treating the left side as the key and the right as the value. Use this when your input is already tab-separated.
+
+    ```bash
+    hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+      -inputformat org.apache.hadoop.mapred.KeyValueTextInputFormat \
+      -input  /data/kv-input \
+      -output /data/output \
+      -mapper cat \
+      -reducer reducer.py
+    ```
+  </Tab>
+  <Tab title="SequenceFileAsTextInputFormat">
+    Reads SequenceFiles and converts keys and values to their string representations before piping to the mapper.
+
+    ```bash
+    hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+      -inputformat org.apache.hadoop.mapred.SequenceFileAsTextInputFormat \
+      -input  /data/seq-input \
+      -output /data/output \
+      -mapper mapper.py \
+      -reducer reducer.py
+    ```
+  </Tab>
+</Tabs>
+
+## Aggregation scripts
+
+Hadoop Streaming ships with built-in value aggregator scripts that handle common patterns without custom code:
+
+```bash
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+  -input  /data/access-logs \
+  -output /data/counts \
+  -mapper  org.apache.hadoop.mapred.lib.aggregate.ValueAggregatorMapper \
+  -reducer org.apache.hadoop.mapred.lib.aggregate.ValueAggregatorReducer \
+  -combiner org.apache.hadoop.mapred.lib.aggregate.ValueAggregatorCombiner
+```
+
+Your mapper must emit lines in the format `LongValueSum:key\tvalue` (or another supported aggregation type) for the built-in reducer to process them correctly.
+
+## Map-only jobs
+
+Set `-numReduceTasks 0` to skip the reduce phase entirely. Output goes directly to HDFS without any sorting or shuffling:
+
+```bash
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+  -numReduceTasks 0 \
+  -input  /data/raw \
+  -output /data/filtered \
+  -mapper filter.py
+```
+
+## Passing configuration to tasks
+
+Use `-cmdenv` to set environment variables that are forwarded to the mapper and reducer processes:
+
+```bash
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+  -cmdenv THRESHOLD=10 \
+  -cmdenv LOG_LEVEL=INFO \
+  -input  /data/input \
+  -output /data/output \
+  -mapper  mapper.py \
+  -reducer reducer.py
+```

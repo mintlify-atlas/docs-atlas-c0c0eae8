@@ -1,0 +1,436 @@
+---
+title: 'HDFS shell command reference: hadoop fs and hdfs dfs'
+description: 'Reference for hadoop fs and hdfs dfs shell commands, grouped by category with syntax and examples for file operations, permissions, and admin tasks.'
+---
+
+HDFS exposes a Unix-like shell interface through two equivalent entry points: `hadoop fs` and `hdfs dfs`. Both invoke the same `FsShell` implementation (`org.apache.hadoop.fs.FsShell`) and accept identical arguments. The `hadoop fs` form works with any Hadoop-compatible filesystem (HDFS, S3A, local), while `hdfs dfs` is scoped to HDFS. Use whichever your team prefers—this reference shows both where relevant.
+
+<Note>
+All paths in HDFS commands are either absolute HDFS paths (e.g. `/user/alice/data`) or fully qualified URIs (e.g. `hdfs://namenode:8020/user/alice/data`). Relative paths are resolved against the user's HDFS home directory (`/user/<username>` by default).
+</Note>
+
+## File operations
+
+<AccordionGroup>
+  <Accordion title="-ls: list directory contents">
+    List the files and directories at a given path. By default, does not recurse into subdirectories.
+
+    ```bash
+    # List the root directory
+    hadoop fs -ls /
+
+    # List a specific directory
+    hadoop fs -ls /user/alice
+
+    # Recursive listing
+    hadoop fs -ls -R /user/alice/data
+
+    # Human-readable file sizes
+    hadoop fs -ls -h /user/alice/data
+    ```
+
+    The output columns are: permissions, replication factor, owner, group, size, modification date, path.
+  </Accordion>
+
+  <Accordion title="-mkdir: create a directory">
+    Create one or more directories. Use `-p` to create parent directories that do not yet exist (equivalent to `mkdir -p` on Linux).
+
+    ```bash
+    # Create a single directory
+    hadoop fs -mkdir /user/alice/output
+
+    # Create directory and any missing parents
+    hadoop fs -mkdir -p /user/alice/project/2024/01
+    ```
+  </Accordion>
+
+  <Accordion title="-put / -copyFromLocal: upload files">
+    Copy files or directories from the local filesystem to HDFS. `-put` and `-copyFromLocal` are aliases.
+
+    ```bash
+    # Upload a single file
+    hadoop fs -put /local/path/data.csv /user/alice/data/
+
+    # Upload a directory recursively
+    hadoop fs -put /local/path/dataset/ /user/alice/datasets/
+
+    # Upload and override if the destination exists
+    hadoop fs -put -f /local/path/data.csv /user/alice/data/data.csv
+
+    # Read from stdin and write to HDFS
+    echo "hello" | hadoop fs -put - /user/alice/test/hello.txt
+    ```
+
+    <Tip>
+    For large uploads, consider setting `dfs.replication` temporarily lower on the client to reduce initial write overhead, then let the NameNode re-replicate afterwards.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="-get / -copyToLocal: download files">
+    Copy files or directories from HDFS to the local filesystem.
+
+    ```bash
+    # Download a single file
+    hadoop fs -get /user/alice/data/results.csv /local/output/
+
+    # Download a directory
+    hadoop fs -get /user/alice/data/ /local/backup/
+
+    # Ignore CRC checksum files during download
+    hadoop fs -get -ignoreCrc /user/alice/data/results.csv /local/output/
+    ```
+  </Accordion>
+
+  <Accordion title="-cp: copy within HDFS">
+    Copy files or directories within HDFS. Does not move data through the client—the copy happens server-side.
+
+    ```bash
+    # Copy a file to a new location
+    hadoop fs -cp /user/alice/data/file.csv /user/alice/backup/file.csv
+
+    # Copy a directory
+    hadoop fs -cp -r /user/alice/data/ /user/alice/data-backup/
+
+    # Preserve file attributes (replication factor, block size, timestamps)
+    hadoop fs -cp -p /user/alice/data/file.csv /archive/file.csv
+    ```
+  </Accordion>
+
+  <Accordion title="-mv: move or rename">
+    Move or rename files and directories within HDFS. This is a metadata-only operation on the NameNode; no block data moves.
+
+    ```bash
+    # Rename a file
+    hadoop fs -mv /user/alice/output/part-0000 /user/alice/output/results.csv
+
+    # Move a directory
+    hadoop fs -mv /user/alice/staging/ /user/alice/production/
+    ```
+
+    <Warning>
+    `-mv` only works within the same filesystem. You cannot use it to move data between HDFS and S3A, for example.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="-rm / -rmdir: delete files and directories">
+    Remove files or directories from HDFS.
+
+    ```bash
+    # Delete a file (moves to trash by default)
+    hadoop fs -rm /user/alice/data/old-file.csv
+
+    # Skip the trash and delete immediately
+    hadoop fs -rm -skipTrash /user/alice/data/old-file.csv
+
+    # Delete a directory and all its contents
+    hadoop fs -rm -r /user/alice/staging/
+
+    # Remove an empty directory
+    hadoop fs -rmdir /user/alice/empty-dir/
+    ```
+
+    <Note>
+    By default, deleted files go to the user's `.Trash` directory in HDFS (if trash is enabled via `fs.trash.interval`). Use `-skipTrash` to bypass the trash and free space immediately.
+    </Note>
+  </Accordion>
+</AccordionGroup>
+
+## Content operations
+
+<AccordionGroup>
+  <Accordion title="-cat and -text: read file contents">
+    Print the contents of HDFS files to stdout. `-text` additionally decompresses files in formats HDFS understands (gzip, bzip2, snappy-framed, LZO).
+
+    <CodeGroup>
+      ```bash -cat
+      # Print a plain text file
+      hadoop fs -cat /user/alice/data/readme.txt
+
+      # Concatenate multiple files
+      hadoop fs -cat /user/alice/data/part-0000 /user/alice/data/part-0001
+      ```
+
+      ```bash -text
+      # Decompress and print a gzip file
+      hadoop fs -text /user/alice/data/data.csv.gz
+
+      # Read a SequenceFile as text
+      hadoop fs -text /user/alice/data/records.seq
+      ```
+    </CodeGroup>
+  </Accordion>
+
+  <Accordion title="-tail: print the end of a file">
+    Print the last kilobyte of a file to stdout. Useful for checking the end of log files stored in HDFS.
+
+    ```bash
+    # Print the last 1 KB of a file
+    hadoop fs -tail /user/alice/logs/job.log
+
+    # Follow a file as it is appended (like tail -f)
+    hadoop fs -tail -f /user/alice/logs/streaming.log
+    ```
+  </Accordion>
+
+  <Accordion title="-appendToFile: append to an existing file">
+    Append local file content to an existing HDFS file, or create the file if it does not exist. You can also pipe stdin.
+
+    ```bash
+    # Append a local file to an HDFS file
+    hadoop fs -appendToFile /local/path/new-data.txt /user/alice/data/combined.txt
+
+    # Append multiple local files
+    hadoop fs -appendToFile /local/a.txt /local/b.txt /user/alice/data/combined.txt
+
+    # Append from stdin
+    echo "new line" | hadoop fs -appendToFile - /user/alice/data/combined.txt
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Permission operations
+
+<AccordionGroup>
+  <Accordion title="-chmod: change file permissions">
+    Change file or directory permissions using octal or symbolic notation.
+
+    ```bash
+    # Set permissions using octal notation
+    hadoop fs -chmod 755 /user/alice/scripts/run.sh
+
+    # Set permissions using symbolic notation
+    hadoop fs -chmod g+w /user/alice/shared/
+
+    # Apply recursively
+    hadoop fs -chmod -R 750 /user/alice/data/
+    ```
+  </Accordion>
+
+  <Accordion title="-chown: change owner">
+    Change the owner and/or group of a file or directory.
+
+    ```bash
+    # Change owner
+    hadoop fs -chown bob /user/alice/data/shared-file.csv
+
+    # Change owner and group
+    hadoop fs -chown bob:analytics /user/alice/data/shared-file.csv
+
+    # Apply recursively
+    hadoop fs -chown -R alice:data-team /user/alice/project/
+    ```
+  </Accordion>
+
+  <Accordion title="-chgrp: change group">
+    Change the group of a file or directory. Equivalent to `chown :group`.
+
+    ```bash
+    # Change the group of a file
+    hadoop fs -chgrp analytics /user/alice/data/report.csv
+
+    # Apply recursively
+    hadoop fs -chgrp -R data-team /user/alice/project/
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Information and quota operations
+
+<AccordionGroup>
+  <Accordion title="-stat: print file or directory attributes">
+    Print attributes of a file or directory using a format string. Useful for scripting.
+
+    ```bash
+    # Print the file size in bytes
+    hadoop fs -stat %b /user/alice/data/file.csv
+
+    # Print owner, group, size, and path
+    hadoop fs -stat "%u %g %b %n" /user/alice/data/file.csv
+
+    # Print the modification time
+    hadoop fs -stat %y /user/alice/data/file.csv
+    ```
+
+    Common format specifiers: `%b` (block size), `%n` (filename), `%o` (block size), `%r` (replication), `%u` (owner), `%g` (group), `%y` (modification time).
+  </Accordion>
+
+  <Accordion title="-du: disk usage">
+    Show the amount of space used by files or directories.
+
+    ```bash
+    # Show the size of each item in a directory
+    hadoop fs -du /user/alice/data/
+
+    # Human-readable output
+    hadoop fs -du -h /user/alice/data/
+
+    # Summarize total usage of a directory (like du -s)
+    hadoop fs -du -s /user/alice/data/
+
+    # Show disk usage including replication
+    hadoop fs -du -s -h /user/alice/
+    ```
+  </Accordion>
+
+  <Accordion title="-df: disk free space">
+    Display the capacity, used space, and available space in the HDFS cluster.
+
+    ```bash
+    # Show cluster-wide disk usage
+    hadoop fs -df /
+
+    # Human-readable output
+    hadoop fs -df -h /
+    ```
+  </Accordion>
+
+  <Accordion title="-count: count files, directories, and bytes">
+    Count the number of directories, files, and bytes in a path. Optionally includes quota information.
+
+    ```bash
+    # Count directories, files, and bytes
+    hadoop fs -count /user/alice/data/
+
+    # Include quota information
+    hadoop fs -count -q /user/alice/data/
+
+    # Human-readable output
+    hadoop fs -count -h /user/alice/data/
+
+    # Include erasure coding policy information
+    hadoop fs -count -e /user/alice/data/
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Admin operations
+
+These commands use `hdfs dfsadmin` and `hdfs fsck`, which require cluster administrator privileges.
+
+<AccordionGroup>
+  <Accordion title="dfsadmin -report: cluster health summary">
+    Print a summary of the cluster's live DataNodes, storage capacity, and block counts.
+
+    ```bash
+    # Print a full cluster report
+    hdfs dfsadmin -report
+
+    # Report only live DataNodes
+    hdfs dfsadmin -report -live
+
+    # Report only dead DataNodes
+    hdfs dfsadmin -report -dead
+
+    # Report DataNodes that are decommissioning
+    hdfs dfsadmin -report -decommissioning
+    ```
+
+    Sample output for each DataNode includes: hostname, last contact time, total/used/available capacity, and block count.
+  </Accordion>
+
+  <Accordion title="dfsadmin -safemode: manage safe mode">
+    Safe mode is a read-only state during NameNode startup while block reports are being collected. Administrators can also enter safe mode manually before maintenance.
+
+    ```bash
+    # Check current safe mode status
+    hdfs dfsadmin -safemode get
+
+    # Enter safe mode
+    hdfs dfsadmin -safemode enter
+
+    # Leave safe mode
+    hdfs dfsadmin -safemode leave
+
+    # Wait until the cluster leaves safe mode (useful in scripts)
+    hdfs dfsadmin -safemode wait
+    ```
+  </Accordion>
+
+  <Accordion title="fsck: file system check">
+    Analyze the health of the HDFS namespace, checking for under-replicated, over-replicated, missing, or corrupt blocks.
+
+    ```bash
+    # Check the entire filesystem
+    hdfs fsck /
+
+    # Check a specific path
+    hdfs fsck /user/alice/data/
+
+    # Show detailed block information per file
+    hdfs fsck / -files -blocks -locations
+
+    # Find and list corrupt files
+    hdfs fsck / -list-corruptfileblocks
+
+    # Attempt to move corrupt files to /lost+found
+    hdfs fsck / -move
+    ```
+
+    <Warning>
+    Running `hdfs fsck` on a large cluster can be slow and will generate significant NameNode RPC load. Run it during off-peak hours or scope it to a specific directory.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="dfsadmin -refreshNodes: update DataNode configuration">
+    After editing `dfs.hosts` or `dfs.hosts.exclude` to add or decommission DataNodes, use this command to apply the changes without restarting the NameNode.
+
+    ```bash
+    # Reload the DataNode allow/exclude lists
+    hdfs dfsadmin -refreshNodes
+    ```
+  </Accordion>
+
+  <Accordion title="balancer: rebalance data across DataNodes">
+    Over time, data can become unevenly distributed across DataNodes (especially after adding new nodes). The HDFS balancer moves blocks from over-utilized nodes to under-utilized ones.
+
+    ```bash
+    # Run the balancer with default threshold (10%)
+    hdfs balancer
+
+    # Run with a custom threshold (5% deviation allowed)
+    hdfs balancer -threshold 5
+
+    # Limit bandwidth used per DataNode
+    hdfs dfsadmin -setBalancerBandwidth 104857600  # 100 MB/s
+    hdfs balancer
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Common patterns
+
+<CodeGroup>
+  ```bash Upload a local dataset
+  # Create the target directory
+  hadoop fs -mkdir -p /user/alice/datasets/2024-01
+
+  # Upload all CSV files from a local directory
+  hadoop fs -put /local/data/*.csv /user/alice/datasets/2024-01/
+
+  # Verify the upload
+  hadoop fs -ls -h /user/alice/datasets/2024-01/
+  hadoop fs -du -s -h /user/alice/datasets/2024-01/
+  ```
+
+  ```bash Check cluster health
+  # Overall cluster report
+  hdfs dfsadmin -report
+
+  # Find under-replicated blocks
+  hdfs fsck / -list-corruptfileblocks
+
+  # Show disk usage by top-level directory
+  hadoop fs -du -h /
+  ```
+
+  ```bash Manage output directories
+  # Check if output directory already exists (common in MapReduce jobs)
+  hadoop fs -test -d /user/alice/output && hadoop fs -rm -r /user/alice/output
+
+  # Create fresh output directory
+  hadoop fs -mkdir /user/alice/output
+
+  # Download results after job completion
+  hadoop fs -get /user/alice/output/ /local/results/
+  ```
+</CodeGroup>

@@ -1,0 +1,111 @@
+---
+title: 'HDFS: Hadoop Distributed File System overview'
+description: 'Learn how HDFS stores large datasets reliably across commodity hardware using block replication and a NameNode/DataNode architecture.'
+---
+
+The Hadoop Distributed File System (HDFS) is a distributed storage layer designed to hold very large datasets reliably on clusters of commodity hardware. Rather than requiring expensive, fault-tolerant machines, HDFS achieves reliability through software-level replication: each block of data is copied to multiple nodes so that the failure of any individual disk or machine is transparent to clients. HDFS is optimized for high-throughput sequential access to large files, making it the natural storage layer for batch-oriented workloads like MapReduce, Spark, and Hive.
+
+## Key design goals
+
+HDFS was built around a specific set of constraints that differ from a typical POSIX filesystem:
+
+- **Fault tolerance on commodity hardware** — hardware failures are the norm, not the exception. HDFS detects failures and recovers automatically using data replication.
+- **High streaming throughput over low latency** — workloads read entire files sequentially. HDFS favors sustained read bandwidth over fast random-access response times.
+- **Large files** — HDFS is designed for files ranging from hundreds of megabytes to multiple terabytes. It is not optimized for many small files.
+- **Write-once, read-many access** — files are written once and then read, possibly many times. Appends are supported but arbitrary in-place edits are not.
+- **Portability across heterogeneous hardware and software platforms** — the HDFS client is a pure Java library that runs on any JVM-capable platform.
+
+## HDFS vs a POSIX filesystem
+
+| Feature | POSIX filesystem | HDFS |
+|---|---|---|
+| Block size | 4 KB (typical) | 128 MB (default) |
+| Random writes | Yes | No (append only) |
+| Replication | No | Yes (default 3×) |
+| Metadata location | On-disk inode | In-memory NameNode |
+| Optimized for | Low-latency random I/O | High-throughput sequential I/O |
+
+<Note>
+The large default block size (128 MB, configured via `dfs.blocksize`) minimizes the amount of metadata the NameNode must track for large files and reduces seek overhead for sequential reads.
+</Note>
+
+## Core components
+
+HDFS separates responsibility between two types of nodes: one that manages file system metadata and many that store raw data.
+
+### NameNode
+
+The NameNode is the metadata server. It holds the entire file system namespace—directory tree, file-to-block mapping, and block locations—entirely in memory for fast access. Every operation that modifies the namespace (create, rename, delete) is durably recorded in the edit log before being acknowledged to the client. On restart, the NameNode replays the edit log against the last persisted `fsimage` snapshot to reconstruct its in-memory state.
+
+The NameNode does **not** store block data itself. It maintains a block-to-DataNode map that is rebuilt at startup from block reports sent by each DataNode.
+
+Key source: `NameNode.java`, `FSNamesystem.java`, `FSImage.java` in `hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/`
+
+### DataNode
+
+DataNodes are the worker nodes that store actual block data on their local disks. Each DataNode registers with the NameNode on startup, then periodically sends:
+
+- **Heartbeats** — to confirm the DataNode is alive (default every 3 seconds).
+- **Block reports** — a full inventory of all blocks stored locally (default every 6 hours), used by the NameNode to maintain its block map.
+
+When a client reads or writes data, it communicates directly with DataNodes; the NameNode is not in the data path.
+
+Key source: `DataNode.java`, `BlockPoolManager.java` in `hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/`
+
+## Block-based storage and replication
+
+HDFS splits every file into fixed-size blocks (default 128 MB) and stores each block on multiple DataNodes. With the default replication factor of 3, each block exists on three different DataNodes. The block placement policy is rack-aware: the first replica goes on the local node, the second on a different rack, and the third on the same rack as the second. This ensures both rack-level fault tolerance and reduced cross-rack bandwidth during reads.
+
+```xml
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.replication</name>
+  <value>3</value>
+</property>
+<property>
+  <name>dfs.blocksize</name>
+  <value>134217728</value>  <!-- 128 MB in bytes -->
+</property>
+```
+
+## Key configuration properties
+
+The constants below are defined in `DFSConfigKeys.java` and `HdfsClientConfigKeys.java`.
+
+| Property | Default | Description |
+|---|---|---|
+| `dfs.blocksize` | `134217728` (128 MB) | Size of each HDFS block in bytes |
+| `dfs.replication` | `3` | Default number of block replicas |
+| `dfs.namenode.name.dir` | `file://${hadoop.tmp.dir}/dfs/name` | Directories where the NameNode stores fsimage and edit log |
+| `dfs.datanode.data.dir` | `file://${hadoop.tmp.dir}/dfs/data` | Directories where DataNodes store block data |
+| `dfs.stream-buffer-size` | `4096` | Buffer size for DFS I/O streams |
+
+## When to use HDFS vs cloud object storage
+
+HDFS is the right choice when:
+
+- You need low-latency access from co-located compute (MapReduce, Spark running on the same cluster).
+- Your workload involves large sequential reads of files that rarely change.
+- You want a POSIX-like directory hierarchy with rename and move semantics.
+
+Cloud object storage (S3, GCS, ADLS) may be preferable when:
+
+- Storage and compute scale independently (serverless query engines, ephemeral clusters).
+- You need pay-as-you-go storage without pre-provisioned capacity.
+- Durability and cross-region replication are managed by the cloud provider.
+
+Many production deployments combine both: long-term cold data lives in object storage, while active processing uses HDFS for performance.
+
+## Explore further
+
+<CardGroup cols={3}>
+  <Card title="Architecture" icon="layers" href="/hdfs/architecture">
+    Deep-dive into NameNode internals, the read and write paths, and high availability with Active/Standby NameNodes.
+  </Card>
+  <Card title="Commands" icon="terminal" href="/hdfs/commands">
+    Complete reference for `hadoop fs` and `hdfs dfs` shell commands, grouped by category with examples.
+  </Card>
+  <Card title="Federation" icon="diagram-project" href="/hdfs/federation">
+    Scale beyond a single NameNode with HDFS Federation, Router-Based Federation, and ViewFs.
+  </Card>
+</CardGroup>

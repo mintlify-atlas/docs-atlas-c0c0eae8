@@ -1,0 +1,250 @@
+---
+title: 'DistCp: Distributed Copy for Hadoop'
+description: 'Copy large datasets across HDFS clusters or to cloud storage using MapReduce. Covers common options, incremental sync, and cross-cluster replication.'
+---
+
+DistCp (Distributed Copy) is a tool for large-scale, parallel data movement across HDFS clusters or between HDFS and cloud storage. Rather than copying files sequentially on the client, DistCp launches a MapReduce job where each map task copies a subset of the files, distributing both the work and the network load across the cluster. It is the standard solution for cluster migrations, disaster recovery replication, and feeding data pipelines between environments.
+
+## Basic usage
+
+```bash
+hadoop distcp hdfs://nn1:9000/source hdfs://nn2:9000/dest
+```
+
+You can provide multiple source paths:
+
+```bash
+hadoop distcp hdfs://nn1:9000/data/2024 hdfs://nn1:9000/data/2025 hdfs://nn2:9000/archive/
+```
+
+## Common options
+
+<AccordionGroup>
+  <Accordion title="-p — Preserve file attributes">
+    By default, `-p` preserves replication factor, block size, user, group, permission, checksum type, and timestamps. You can pass specific attribute codes to preserve only a subset:
+
+    | Code | Attribute |
+    |------|-----------|
+    | `r`  | Replication factor |
+    | `b`  | Block size |
+    | `u`  | User |
+    | `g`  | Group |
+    | `p`  | Permission |
+    | `c`  | Checksum type |
+    | `a`  | ACLs |
+    | `x`  | Extended attributes (XATTRs) |
+    | `t`  | Timestamps |
+    | `e`  | Erasure coding policy (HDFS only) |
+
+    ```bash
+    # Preserve user, group, and permissions only
+    hadoop distcp -pug hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+  </Accordion>
+
+  <Accordion title="-update — Sync missing files">
+    Copy only files that are missing in the destination or differ from the source. This is the primary mechanism for incremental syncs.
+
+    ```bash
+    hadoop distcp -update hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+
+    <Note>
+      `-update` compares file sizes and checksums. Use `-skipcrccheck` to skip checksum comparison when copying between filesystems with incompatible checksum implementations.
+    </Note>
+  </Accordion>
+
+  <Accordion title="-overwrite — Force overwrite">
+    Overwrite destination files unconditionally, even if they already exist and match the source.
+
+    ```bash
+    hadoop distcp -overwrite hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+  </Accordion>
+
+  <Accordion title="-delete — Remove files absent from source">
+    Delete files in the destination that do not exist in the source. Must be combined with `-update` or `-overwrite`.
+
+    ```bash
+    hadoop distcp -update -delete hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+
+    <Warning>
+      `-delete` permanently removes files from the destination. Verify your source and destination paths carefully before running.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="-m — Control map task count">
+    Set the maximum number of concurrent map tasks. DistCp divides the work as evenly as possible across them.
+
+    ```bash
+    hadoop distcp -m 20 hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+  </Accordion>
+
+  <Accordion title="-bandwidth — Throttle per-map bandwidth">
+    Limit each map task to a specified bandwidth in MB/s. Useful for copying across links shared with production traffic.
+
+    ```bash
+    hadoop distcp -bandwidth 100 hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+  </Accordion>
+
+  <Accordion title="-filters — Exclude paths by pattern">
+    Provide a file containing one regex pattern per line. Paths matching any pattern are excluded from the copy.
+
+    ```bash
+    hadoop distcp -filters /tmp/excludes.txt hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+
+    Example `excludes.txt`:
+    ```text
+    .*\.tmp$
+    .*/staging/.*
+    ```
+  </Accordion>
+
+  <Accordion title="-diff — Snapshot-based incremental copy">
+    Use HDFS snapshot diffs to identify only the files that changed between two snapshots, avoiding a full directory scan.
+
+    ```bash
+    hadoop distcp -update -diff snap1 snap2 hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+
+    Both source directories must have snapshots enabled and the named snapshots must exist.
+  </Accordion>
+
+  <Accordion title="-atomic — All-or-nothing commit">
+    Copy all files to a temporary work path first, then rename them to the final destination atomically. Incompatible with `-update` and `-delete`.
+
+    ```bash
+    hadoop distcp -atomic hdfs://nn1:9000/src hdfs://nn2:9000/dest
+    ```
+  </Accordion>
+
+  <Accordion title="-direct — Skip temporary rename">
+    Write output files directly to their final destination path, skipping the intermediate temporary file and rename. Recommended when copying to object stores such as S3A that implement rename as a costly copy-then-delete.
+
+    ```bash
+    hadoop distcp -direct hdfs://nn1:9000/src s3a://my-bucket/dest/
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Cross-cluster replication
+
+<Steps>
+  <Step title="Verify connectivity">
+    Confirm that the cluster running the DistCp job can reach the remote NameNode and DataNodes. Both clusters must be accessible over the network by the YARN NodeManagers.
+  </Step>
+  <Step title="Run the copy">
+    ```bash
+    hadoop distcp \
+      -m 50 \
+      -bandwidth 200 \
+      -update \
+      hdfs://source-nn:8020/data/warehouse \
+      hdfs://dest-nn:8020/data/warehouse
+    ```
+  </Step>
+  <Step title="Verify integrity">
+    After the job completes, compare file counts and sizes, or re-run with `-update` — if no files are copied, the two directories are in sync.
+
+    ```bash
+    hadoop fs -count hdfs://source-nn:8020/data/warehouse
+    hadoop fs -count hdfs://dest-nn:8020/data/warehouse
+    ```
+  </Step>
+</Steps>
+
+## Copying to and from cloud storage
+
+DistCp works with any Hadoop-compatible filesystem. Use the appropriate URI scheme for your cloud provider.
+
+<Tabs>
+  <Tab title="Amazon S3">
+    ```bash
+    hadoop distcp \
+      -direct \
+      -update \
+      hdfs://nn1:9000/data/export \
+      s3a://my-bucket/data/export
+    ```
+  </Tab>
+  <Tab title="Azure ADLS Gen2">
+    ```bash
+    hadoop distcp \
+      -update \
+      hdfs://nn1:9000/data/export \
+      abfss://container@account.dfs.core.windows.net/data/export
+    ```
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    ```bash
+    hadoop distcp \
+      -update \
+      hdfs://nn1:9000/data/export \
+      gs://my-bucket/data/export
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  Use `-direct` when writing to S3A. Without it, DistCp renames temporary output files on completion, which triggers expensive copy-then-delete operations on S3.
+</Tip>
+
+## Snapshot-based incremental replication
+
+Snapshot diffs let DistCp copy only changed files without scanning the entire source tree, which is critical for large directories.
+
+<Steps>
+  <Step title="Enable snapshots on the source">
+    ```bash
+    hdfs dfsadmin -allowSnapshot hdfs://nn1:9000/data/warehouse
+    ```
+  </Step>
+  <Step title="Create an initial snapshot and do the first full copy">
+    ```bash
+    hdfs dfs -createSnapshot hdfs://nn1:9000/data/warehouse snap1
+    hadoop distcp hdfs://nn1:9000/data/warehouse hdfs://nn2:9000/data/warehouse
+    hdfs dfs -createSnapshot hdfs://nn2:9000/data/warehouse snap1
+    ```
+  </Step>
+  <Step title="Create a second snapshot after changes accumulate">
+    ```bash
+    hdfs dfs -createSnapshot hdfs://nn1:9000/data/warehouse snap2
+    ```
+  </Step>
+  <Step title="Run an incremental copy using the diff">
+    ```bash
+    hadoop distcp \
+      -update \
+      -diff snap1 snap2 \
+      hdfs://nn1:9000/data/warehouse \
+      hdfs://nn2:9000/data/warehouse
+    ```
+  </Step>
+  <Step title="Advance the snapshot on the destination">
+    ```bash
+    hdfs dfs -createSnapshot hdfs://nn2:9000/data/warehouse snap2
+    hdfs dfs -deleteSnapshot hdfs://nn1:9000/data/warehouse snap1
+    hdfs dfs -deleteSnapshot hdfs://nn2:9000/data/warehouse snap1
+    ```
+  </Step>
+</Steps>
+
+## Additional options reference
+
+| Option | Description |
+|--------|-------------|
+| `-i` | Ignore failures; log failed files and continue |
+| `-v` | Verbose log: include path and size in SKIP/COPY entries |
+| `-append` | Append new data to existing destination files (requires `-update`, CRC must not be skipped) |
+| `-async` | Submit the job and return immediately (non-blocking) |
+| `-log <dir>` | Write execution logs to a directory on DFS |
+| `-f <file>` | Read the list of source paths from a file |
+| `-numListstatusThreads <n>` | Threads used to build the source file listing (max 40) |
+| `-blocksperchunk <n>` | Split large files into chunks of this many blocks for parallel transfer |
+| `-copybuffersize <bytes>` | Size of the per-map copy buffer (default 8192 B) |
+| `-skipcrccheck` | Skip checksum comparison when determining which files to copy |
+| `-strategy <name>` | Copy strategy: `dynamic` or the default size-based distribution |

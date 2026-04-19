@@ -1,122 +1,85 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Hadoop",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#6bbee5",
+    "light": "#0f1b28",
+    "dark": "#f5f6f4"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "https://media.brand.dev/f82d1cb1-3a4f-4dca-829d-96e9a6043fd4.png",
+  "logo": {
+    "light": "https://media.brand.dev/d357e481-ebd6-4cc5-85cc-5e258177e875.png",
+    "dark": "https://media.brand.dev/d357e481-ebd6-4cc5-85cc-5e258177e875.png"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/apache/hadoop"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/apache/hadoop"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Getting Started",
         "groups": [
           {
-            "group": "Getting started",
-            "pages": [
-              "index",
-              "quickstart",
-              "development"
-            ]
+            "group": "Overview",
+            "pages": ["introduction", "architecture", "quickstart"]
           },
           {
-            "group": "Customization",
-            "pages": [
-              "essentials/settings",
-              "essentials/navigation"
-            ]
-          },
-          {
-            "group": "Writing content",
-            "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
-            ]
-          },
-          {
-            "group": "AI tools",
-            "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
-            ]
+            "group": "Installation",
+            "pages": ["installation/single-node", "installation/cluster-setup", "installation/building-from-source"]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "Core Components",
         "groups": [
           {
-            "group": "API documentation",
-            "pages": [
-              "api-reference/introduction"
-            ]
+            "group": "HDFS",
+            "pages": ["hdfs/overview", "hdfs/architecture", "hdfs/commands", "hdfs/federation"]
           },
           {
-            "group": "Endpoint examples",
-            "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
-            ]
+            "group": "YARN",
+            "pages": ["yarn/overview", "yarn/resource-management", "yarn/capacity-scheduler", "yarn/fair-scheduler"]
+          },
+          {
+            "group": "MapReduce",
+            "pages": ["mapreduce/overview", "mapreduce/tutorial", "mapreduce/compatibility"]
+          },
+          {
+            "group": "Common",
+            "pages": ["common/filesystem-api", "common/configuration", "common/security"]
+          }
+        ]
+      },
+      {
+        "tab": "Operations & Tools",
+        "groups": [
+          {
+            "group": "Administration",
+            "pages": ["operations/cluster-administration", "operations/hdfs-admin", "operations/yarn-admin"]
+          },
+          {
+            "group": "Security",
+            "pages": ["security/kerberos", "security/transparent-encryption", "security/service-authorization"]
+          },
+          {
+            "group": "Tools",
+            "pages": ["tools/distcp", "tools/streaming", "tools/archives"]
+          },
+          {
+            "group": "Cloud Storage",
+            "pages": ["cloud/aws-s3", "cloud/azure", "cloud/gcs"]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

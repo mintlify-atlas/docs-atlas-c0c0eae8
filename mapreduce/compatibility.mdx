@@ -1,0 +1,196 @@
+---
+title: 'MapReduce API: migrating from mapred to mapreduce'
+description: 'Understand the differences between the old mapred and new mapreduce APIs, how to migrate between them, and which deprecated APIs to avoid in modern Hadoop.'
+---
+
+Hadoop ships with two generations of the MapReduce programming API. The original API, in the `org.apache.hadoop.mapred` package, dates back to Hadoop 0.1 and uses a callback-based interface. A redesigned API was introduced in Hadoop 0.20 under `org.apache.hadoop.mapreduce` and is the one all new development should target. Both APIs are still supported for backwards compatibility, and jobs written with the old API continue to run on modern YARN clusters, but mixing types from both packages in a single job is not supported.
+
+## Old API vs new API at a glance
+
+| Aspect | Old API (`org.apache.hadoop.mapred`) | New API (`org.apache.hadoop.mapreduce`) |
+|---|---|---|
+| Package | `org.apache.hadoop.mapred` | `org.apache.hadoop.mapreduce` |
+| Mapper base class | `MapReduceBase` + `Mapper` interface | `Mapper<KEYIN,VALUEIN,KEYOUT,VALUEOUT>` abstract class |
+| Reducer base class | `MapReduceBase` + `Reducer` interface | `Reducer<KEYIN,VALUEIN,KEYOUT,VALUEOUT>` abstract class |
+| Output collection | `OutputCollector`, `Reporter` parameters | `Context` object (combines both) |
+| Job configuration | `JobConf` extends `Configuration` | `Job` wraps `Configuration` |
+| Job submission | `JobClient.runJob(conf)` | `job.waitForCompletion(true)` |
+| Input split | `InputSplit` interface | `InputSplit` abstract class |
+| Progress reporting | `reporter.progress()` | `context.progress()` |
+
+## Old API example
+
+```java OldApiWordCount.java
+import org.apache.hadoop.mapred.MapReduceBase;
+import org.apache.hadoop.mapred.Mapper;
+import org.apache.hadoop.mapred.OutputCollector;
+import org.apache.hadoop.mapred.Reporter;
+
+public class OldMapper extends MapReduceBase
+    implements Mapper<LongWritable, Text, Text, IntWritable> {
+
+  private final static IntWritable one = new IntWritable(1);
+  private Text word = new Text();
+
+  @Override
+  public void map(LongWritable key, Text value,
+                  OutputCollector<Text, IntWritable> output,
+                  Reporter reporter) throws IOException {
+    StringTokenizer itr = new StringTokenizer(value.toString());
+    while (itr.hasMoreTokens()) {
+      word.set(itr.nextToken());
+      output.collect(word, one);
+    }
+  }
+}
+```
+
+## New API example
+
+```java NewApiWordCount.java
+import org.apache.hadoop.mapreduce.Mapper;
+
+public class NewMapper extends Mapper<Object, Text, Text, IntWritable> {
+
+  private final static IntWritable one = new IntWritable(1);
+  private Text word = new Text();
+
+  @Override
+  public void map(Object key, Text value, Context context)
+      throws IOException, InterruptedException {
+    StringTokenizer itr = new StringTokenizer(value.toString());
+    while (itr.hasMoreTokens()) {
+      word.set(itr.nextToken());
+      context.write(word, one);     // Context replaces OutputCollector
+    }
+  }
+}
+```
+
+The `Context` object passed to `map()` and `reduce()` combines the roles of `OutputCollector` (emit output via `context.write()`) and `Reporter` (report progress via `context.progress()`, set status via `context.setStatus()`, and increment counters via `context.getCounter(...).increment(1)`).
+
+## Migrating from the old API
+
+<Steps>
+  <Step title="Update imports">
+    Replace all `org.apache.hadoop.mapred.*` imports with `org.apache.hadoop.mapreduce.*`. The core classes have the same names but live in the new package.
+
+    ```java
+    // Old
+    import org.apache.hadoop.mapred.Mapper;
+    import org.apache.hadoop.mapred.Reducer;
+    import org.apache.hadoop.mapred.JobConf;
+    import org.apache.hadoop.mapred.JobClient;
+
+    // New
+    import org.apache.hadoop.mapreduce.Mapper;
+    import org.apache.hadoop.mapreduce.Reducer;
+    import org.apache.hadoop.mapreduce.Job;
+    import org.apache.hadoop.conf.Configuration;
+    ```
+  </Step>
+
+  <Step title="Extend abstract classes instead of interfaces">
+    In the old API, `Mapper` and `Reducer` were interfaces implemented alongside `MapReduceBase`. In the new API, extend the generic abstract class directly:
+
+    ```java
+    // Old
+    public class MyMapper extends MapReduceBase
+        implements Mapper<LongWritable, Text, Text, IntWritable> { ... }
+
+    // New
+    public class MyMapper
+        extends Mapper<LongWritable, Text, Text, IntWritable> { ... }
+    ```
+  </Step>
+
+  <Step title="Replace OutputCollector and Reporter with Context">
+    The new `map()` and `reduce()` signatures take a single `Context` parameter:
+
+    ```java
+    // Old signature
+    void map(K1 key, V1 value,
+             OutputCollector<K2, V2> output,
+             Reporter reporter) throws IOException
+
+    // New signature
+    void map(K1 key, V1 value,
+             Context context) throws IOException, InterruptedException
+    ```
+
+    Replace `output.collect(k, v)` with `context.write(k, v)` and `reporter.progress()` with `context.progress()`.
+  </Step>
+
+  <Step title="Replace JobConf with Job">
+    ```java
+    // Old
+    JobConf conf = new JobConf(MyJob.class);
+    conf.setMapperClass(MyMapper.class);
+    conf.setReducerClass(MyReducer.class);
+    JobClient.runJob(conf);
+
+    // New
+    Configuration conf = new Configuration();
+    Job job = Job.getInstance(conf, "my job");
+    job.setJarByClass(MyJob.class);
+    job.setMapperClass(MyMapper.class);
+    job.setReducerClass(MyReducer.class);
+    job.waitForCompletion(true);
+    ```
+  </Step>
+
+  <Step title="Update InputFormat and OutputFormat subclasses">
+    If you have custom `InputFormat` or `OutputFormat` classes, migrate them from `org.apache.hadoop.mapred.InputFormat` to `org.apache.hadoop.mapreduce.InputFormat`. The new `InputFormat` is an abstract class and requires implementing `getSplits()` and `createRecordReader()`.
+  </Step>
+</Steps>
+
+## Deprecated APIs to avoid
+
+<AccordionGroup>
+  <Accordion title="JobConf (mapred package)">
+    `org.apache.hadoop.mapred.JobConf` is the old job configuration class. It subclasses `Configuration` and adds numerous setter methods that have equivalents on `Job` in the new API. Avoid it in new code; it is retained only for compatibility.
+  </Accordion>
+  <Accordion title="JobClient (mapred package)">
+    `org.apache.hadoop.mapred.JobClient` was the old mechanism for submitting jobs. Use `Job.waitForCompletion()` or `Job.submit()` in the new API.
+  </Accordion>
+  <Accordion title="MapReduceBase">
+    The `MapReduceBase` class (old API) provided `configure()` and `close()` lifecycle callbacks. In the new API, override `setup(Context)` and `cleanup(Context)` on `Mapper` or `Reducer` instead.
+  </Accordion>
+  <Accordion title="Counters (old API enum-based)">
+    The old API used Java enums directly as counter identifiers. The new API uses `context.getCounter(String group, String name)` or `context.getCounter(Enum e)`, which is more flexible and avoids reflection overhead.
+  </Accordion>
+</AccordionGroup>
+
+## Cross-version compatibility
+
+<Tabs>
+  <Tab title="Hadoop 2.x and 3.x">
+    Jobs written with the new `org.apache.hadoop.mapreduce` API are compatible across Hadoop 2.x and 3.x without recompilation, provided you do not depend on internal (`@InterfaceAudience.Private`) classes. The public API surface is stable across minor and patch versions within a major release.
+  </Tab>
+  <Tab title="Old API jobs on modern clusters">
+    Jobs written with the old `mapred` API continue to run on Hadoop 3.x YARN clusters. The framework internally adapts old `JobConf`-based jobs to the new execution model. There is no need to rewrite working old-API jobs unless you need new features such as `MapContext`, `TaskAttemptContext`, or improved `InputSplit` abstractions.
+  </Tab>
+  <Tab title="Binary compatibility">
+    Hadoop follows semantic versioning for its public APIs. Binaries compiled against Hadoop 2.x may require recompilation against Hadoop 3.x if any public API signatures changed, but the logical MapReduce programming model is unchanged. Check the Hadoop migration guide for the specific release when upgrading across major versions.
+  </Tab>
+</Tabs>
+
+## Job configuration backwards compatibility
+
+Properties set via `JobConf` map to the same underlying `Configuration` keys as properties set via `Job`. The table below lists common old-API setters and their `Configuration` key equivalents:
+
+| Old JobConf setter | Configuration key |
+|---|---|
+| `conf.setNumMapTasks(n)` | `mapreduce.job.maps` |
+| `conf.setNumReduceTasks(n)` | `mapreduce.job.reduces` |
+| `conf.setMapperClass(c)` | `mapreduce.job.map.class` |
+| `conf.setReducerClass(c)` | `mapreduce.job.reduce.class` |
+| `conf.setCombinerClass(c)` | `mapreduce.job.combine.class` |
+| `conf.setInputFormat(f)` | `mapreduce.job.inputformat.class` |
+| `conf.setOutputFormat(f)` | `mapreduce.job.outputformat.class` |
+| `conf.setOutputKeyClass(c)` | `mapreduce.job.output.key.class` |
+| `conf.setOutputValueClass(c)` | `mapreduce.job.output.value.class` |
+
+<Warning>
+  Do not mix classes from `org.apache.hadoop.mapred` and `org.apache.hadoop.mapreduce` in the same job. For example, using a new-API `Mapper` with an old-API `JobConf` will result in a `ClassCastException` at runtime.
+</Warning>

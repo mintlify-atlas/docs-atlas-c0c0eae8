@@ -1,0 +1,296 @@
+---
+title: "YARN administration: rmadmin, queues, and RM HA"
+description: "Manage YARN queues, nodes, and applications with rmadmin. Covers log aggregation, Timeline Service, and ResourceManager high availability."
+---
+
+YARN (Yet Another Resource Negotiator) is the cluster resource management layer of Hadoop. It schedules containers for applications across NodeManagers and enforces capacity policies defined in the scheduler configuration. The `yarn rmadmin` command is the primary administrative interface to the ResourceManager, enabling live queue refreshes, node management, and high-availability failover—most of which require no daemon restart.
+
+## yarn rmadmin command reference
+
+### Queue management
+
+Refresh queue configuration from `capacity-scheduler.xml` (or `fair-scheduler.xml`) without restarting the ResourceManager:
+
+```bash
+yarn rmadmin -refreshQueues
+```
+
+This picks up changes to queue capacities, ACLs, and states. It does not terminate running applications.
+
+<Note>
+`-refreshQueues` does not validate the updated configuration before applying it. Always verify your scheduler XML with a linter or dry-run tool before issuing this command in production.
+</Note>
+
+### Node management
+
+```bash
+# Refresh node hosts file (picks up dfs.hosts / dfs.hosts.exclude changes)
+yarn rmadmin -refreshNodes
+
+# Graceful decommission with a client-side 60-second timeout
+yarn rmadmin -refreshNodes -g 60 -client
+
+# Graceful decommission tracked by the ResourceManager (server-side timeout)
+yarn rmadmin -refreshNodes -g 120 -server
+
+# Check which nodes are still being decommissioned
+yarn rmadmin -checkForDecommissioningNodes
+```
+
+### User and group mappings
+
+```bash
+# Reload group provider cache (e.g., after LDAP group changes)
+yarn rmadmin -refreshUserToGroupsMappings
+
+# Reload superuser proxy configuration
+yarn rmadmin -refreshSuperUserGroupsConfiguration
+```
+
+### ACL refresh
+
+```bash
+# Reload yarn.admin.acl and service-level ACLs from configuration
+yarn rmadmin -refreshAdminAcls
+yarn rmadmin -refreshServiceAcl
+```
+
+### Group lookup
+
+```bash
+# Look up the groups a user belongs to (as seen by Hadoop)
+yarn rmadmin -getGroups <username>
+```
+
+## Queue management in depth
+
+The Capacity Scheduler and Fair Scheduler both support live queue refresh through `capacity-scheduler.xml` and `fair-scheduler.xml` respectively. The workflow for applying a queue configuration change is:
+
+<Steps>
+  <Step title="Edit the scheduler configuration file">
+    ```xml
+    <!-- capacity-scheduler.xml: add a new leaf queue under root.default -->
+    <property>
+      <name>yarn.scheduler.capacity.root.default.analytics.capacity</name>
+      <value>20</value>
+    </property>
+    <property>
+      <name>yarn.scheduler.capacity.root.default.analytics.maximum-capacity</name>
+      <value>40</value>
+    </property>
+    ```
+  </Step>
+  <Step title="Distribute the file to all ResourceManager hosts">
+    ```bash
+    scp capacity-scheduler.xml rm1.example.com:$HADOOP_CONF_DIR/
+    scp capacity-scheduler.xml rm2.example.com:$HADOOP_CONF_DIR/
+    ```
+  </Step>
+  <Step title="Apply the change">
+    ```bash
+    yarn rmadmin -refreshQueues
+    ```
+  </Step>
+  <Step title="Verify the new queue is visible">
+    ```bash
+    yarn queue -status root.default.analytics
+    ```
+  </Step>
+</Steps>
+
+## Node management and decommissioning NodeManagers
+
+The YARN decommission workflow mirrors HDFS but targets NodeManagers. Running containers are allowed to complete (graceful decommission) before the node is removed.
+
+<Steps>
+  <Step title="Configure the exclude file">
+    In `yarn-site.xml`, set the path to the exclusion file:
+
+    ```xml
+    <property>
+      <name>yarn.resourcemanager.nodes.exclude-path</name>
+      <value>/etc/hadoop/conf/yarn.hosts.exclude</value>
+    </property>
+    ```
+  </Step>
+  <Step title="Add the NodeManager hostname">
+    ```bash
+    echo "worker-05.example.com" >> /etc/hadoop/conf/yarn.hosts.exclude
+    ```
+  </Step>
+  <Step title="Trigger a graceful refresh">
+    ```bash
+    # Allow 5 minutes for running containers to finish
+    yarn rmadmin -refreshNodes -g 300 -server
+    ```
+  </Step>
+  <Step title="Monitor decommission state">
+    ```bash
+    yarn node -list -states DECOMMISSIONING
+    yarn node -list -states DECOMMISSIONED
+    ```
+  </Step>
+  <Step title="Stop the NodeManager and clean up">
+    ```bash
+    $HADOOP_HOME/bin/yarn --daemon stop nodemanager
+    ```
+    Remove the hostname from the exclude file and run `-refreshNodes` (without `-g`) to recommission or simply remove the entry.
+  </Step>
+</Steps>
+
+To recommission a previously decommissioned node, remove it from the exclude file and run:
+
+```bash
+yarn rmadmin -refreshNodes
+```
+
+## Application management
+
+```bash
+# List all running applications
+yarn application -list
+
+# Filter by state (RUNNING, ACCEPTED, FINISHED, FAILED, KILLED)
+yarn application -list -appStates RUNNING,ACCEPTED
+
+# Get detailed status for a specific application
+yarn application -status application_1700000000000_0001
+
+# Kill a running application
+yarn application -kill application_1700000000000_0001
+
+# Move an application to a different queue
+yarn application -movetoqueue application_1700000000000_0001 -queue root.batch
+```
+
+## Log aggregation
+
+YARN aggregates container logs from NodeManagers to HDFS after an application finishes, so logs remain accessible even after the NodeManager has recycled them from local disk.
+
+### Enabling log aggregation
+
+```xml
+<!-- yarn-site.xml -->
+<property>
+  <name>yarn.log-aggregation-enable</name>
+  <value>true</value>
+</property>
+<property>
+  <name>yarn.nodemanager.remote-app-log-dir</name>
+  <value>/app-logs</value>
+</property>
+<property>
+  <name>yarn.log-aggregation.retain-seconds</name>
+  <value>604800</value>
+  <description>Retain aggregated logs for 7 days.</description>
+</property>
+```
+
+### Reading aggregated logs
+
+```bash
+# All logs for an application
+yarn logs -applicationId application_1700000000000_0001
+
+# Logs from a specific container
+yarn logs -applicationId application_1700000000000_0001 \
+          -containerId container_1700000000000_0001_01_000001
+
+# Logs from a specific NodeManager node
+yarn logs -applicationId application_1700000000000_0001 \
+          -nodeAddress worker-03.example.com:8042
+```
+
+<Tip>
+Pipe `yarn logs` output through `grep` to locate specific error messages without downloading the full log archive.
+</Tip>
+
+## YARN Timeline Service
+
+The Timeline Service stores and serves application history and metrics that survive beyond the application lifetime. It provides a queryable REST API and a web UI integrated into the ResourceManager.
+
+### Timeline Service v1 configuration
+
+```xml
+<!-- yarn-site.xml -->
+<property>
+  <name>yarn.timeline-service.enabled</name>
+  <value>true</value>
+</property>
+<property>
+  <name>yarn.timeline-service.hostname</name>
+  <value>timeline-host.example.com</value>
+</property>
+<property>
+  <name>yarn.resourcemanager.system-metrics-publisher.enabled</name>
+  <value>true</value>
+</property>
+```
+
+Start the Timeline Service daemon:
+
+```bash
+$HADOOP_HOME/bin/yarn --daemon start timelineserver
+```
+
+Access the Timeline Service web UI at `http://<timeline-host>:8188`.
+
+## ResourceManager high availability
+
+ResourceManager HA uses ZooKeeper for leader election and shared state. One RM is always **Active**; the other(s) are **Standby** and take over automatically on failure.
+
+### Configuration
+
+```xml
+<!-- yarn-site.xml -->
+<property>
+  <name>yarn.resourcemanager.ha.enabled</name>
+  <value>true</value>
+</property>
+<property>
+  <name>yarn.resourcemanager.cluster-id</name>
+  <value>production-cluster</value>
+</property>
+<property>
+  <name>yarn.resourcemanager.ha.rm-ids</name>
+  <value>rm1,rm2</value>
+</property>
+<property>
+  <name>yarn.resourcemanager.hostname.rm1</name>
+  <value>rm-host-1.example.com</value>
+</property>
+<property>
+  <name>yarn.resourcemanager.hostname.rm2</name>
+  <value>rm-host-2.example.com</value>
+</property>
+<property>
+  <name>yarn.resourcemanager.zk-address</name>
+  <value>zk1:2181,zk2:2181,zk3:2181</value>
+</property>
+<property>
+  <name>yarn.resourcemanager.ha.automatic-failover.enabled</name>
+  <value>true</value>
+</property>
+```
+
+### Checking and changing RM state
+
+```bash
+# Check which RM is currently Active
+yarn rmadmin -getServiceState rm1
+yarn rmadmin -getServiceState rm2
+
+# Manually trigger failover from rm1 to rm2
+yarn rmadmin -failover rm1 rm2
+
+# Check the health of an RM
+yarn rmadmin -checkHealth rm1
+```
+
+<Warning>
+Manual failover with `-failover` is disruptive to running applications. Prefer allowing automatic failover to handle transitions unless you need to perform planned maintenance on the Active RM.
+</Warning>
+
+### Automatic failover
+
+With `yarn.resourcemanager.ha.automatic-failover.enabled=true`, the ZKFC (ZooKeeper Failover Controller) embedded in each ResourceManager monitors the Active node and promotes a Standby automatically when the Active becomes unreachable. No additional daemon is required for YARN HA (unlike HDFS HA, which uses a separate ZKFC process).

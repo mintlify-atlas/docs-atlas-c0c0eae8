@@ -1,97 +1,74 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Apache Hadoop: Distributed Data Processing at Scale"
+description: "Apache Hadoop is the industry-standard open-source framework for distributed storage and processing of large datasets across clusters of commodity hardware."
 ---
 
-## Setting up
+Apache Hadoop is a battle-tested framework that enables distributed storage and processing of massive datasets — from gigabytes to petabytes — across clusters of thousands of commodity machines. Built around four core subsystems (HDFS, YARN, MapReduce, and Common), Hadoop provides the reliability, scalability, and fault tolerance required for enterprise data infrastructure.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get Hadoop running on a single node in minutes and run your first MapReduce job.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture Overview" icon="diagram-project" href="/architecture">
+    Understand how HDFS, YARN, and MapReduce work together to process large datasets.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="HDFS" icon="database" href="/hdfs/overview">
+    Learn about the Hadoop Distributed File System for fault-tolerant, scalable storage.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="YARN" icon="server" href="/yarn/overview">
+    Explore the resource management and job scheduling framework powering Hadoop clusters.
   </Card>
-</Columns>
+  <Card title="MapReduce" icon="code" href="/mapreduce/overview">
+    Write and run parallel data processing jobs using the MapReduce programming model.
+  </Card>
+  <Card title="Cluster Setup" icon="network-wired" href="/installation/cluster-setup">
+    Deploy a production-grade multi-node Hadoop cluster step by step.
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## What you can build
 
-Everything you need to create world-class documentation.
+Hadoop powers large-scale data pipelines, analytics workloads, and storage backends across industries. Common use cases include:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+- **Batch data processing** — Run MapReduce or Spark jobs over petabytes of log, clickstream, or sensor data stored in HDFS
+- **Data lake storage** — Store structured and unstructured data in HDFS as a central repository for downstream analytics tools
+- **ETL pipelines** — Use DistCp to move data between clusters or cloud storage, and Hadoop Streaming to process data with any language
+- **Multi-tenant analytics** — Isolate workloads using YARN Capacity Scheduler queues with guaranteed resource allocations
 
-## Need inspiration?
+## Getting started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install Hadoop">
+    Download and configure Hadoop on a single machine to explore core functionality without a full cluster.
+    See [Single Node Setup](/installation/single-node).
+  </Step>
+  <Step title="Explore HDFS">
+    Use the `hadoop fs` CLI to interact with the distributed file system — create directories, upload files, and inspect storage.
+    See [HDFS Commands](/hdfs/commands).
+  </Step>
+  <Step title="Run a MapReduce job">
+    Submit the bundled WordCount example to verify your cluster is processing data correctly.
+    See [MapReduce Tutorial](/mapreduce/tutorial).
+  </Step>
+  <Step title="Scale to a cluster">
+    Configure a multi-node cluster with NameNode, DataNodes, ResourceManager, and NodeManagers.
+    See [Cluster Setup](/installation/cluster-setup).
+  </Step>
+</Steps>
+
+## Core subsystems
+
+<CardGroup cols={2}>
+  <Card title="HDFS" icon="hard-drive" href="/hdfs/overview">
+    Distributed file system designed for fault tolerance, streaming reads, and large block sizes optimized for batch workloads.
+  </Card>
+  <Card title="YARN" icon="layer-group" href="/yarn/overview">
+    Yet Another Resource Negotiator — manages cluster resources and schedules applications from MapReduce to Spark.
+  </Card>
+  <Card title="MapReduce" icon="shuffle" href="/mapreduce/overview">
+    Programming model for writing parallel jobs that process large datasets in distributed fashion across the cluster.
+  </Card>
+  <Card title="Common Utilities" icon="toolbox" href="/common/filesystem-api">
+    Shared libraries including the FileSystem API, Configuration framework, security utilities, and RPC infrastructure.
+  </Card>
+</CardGroup>

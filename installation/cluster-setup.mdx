@@ -1,0 +1,278 @@
+---
+title: 'Hadoop cluster setup on multiple nodes'
+description: 'Configure a fully-distributed Apache Hadoop cluster: node roles, network setup, configuration files, workers file, start order, and cluster health verification.'
+---
+
+A fully-distributed Hadoop cluster runs each daemon on a dedicated node, giving you the fault tolerance, storage capacity, and parallel processing throughput that a single machine cannot provide. Before provisioning hardware, plan which nodes will serve which roles: the NameNode and ResourceManager are typically co-located on a master node because both are control-plane services with similar memory requirements, while DataNodes and NodeManagers run together on every worker node to keep compute close to data. This guide walks through the entire process from network preparation to verifying that all daemons are healthy across the cluster.
+
+## Prerequisites
+
+All nodes in the cluster must meet these requirements before you begin:
+
+- Identical operating system version and Java 17 JDK installation
+- Hadoop binary distribution extracted to the same path on every node (e.g. `/opt/hadoop`)
+- A dedicated `hadoop` OS user with the same UID/GID on all nodes
+- Passwordless SSH from the master node to every worker node (and to itself)
+- Synchronised clocks — use NTP or chrony; skewed clocks cause authentication failures and log confusion
+- Sufficient open file descriptors (`ulimit -n` set to at least 65536)
+
+## Node roles
+
+<CardGroup cols={2}>
+  <Card title="NameNode" icon="database">
+    Manages the HDFS filesystem namespace and metadata. Handles all client requests for file open, close, and rename. Does not store file data itself.
+  </Card>
+  <Card title="Secondary NameNode" icon="copy">
+    Periodically merges the edit log with the filesystem image to prevent the edit log from growing unbounded. It is not a hot standby — use HDFS HA for fault tolerance.
+  </Card>
+  <Card title="DataNode" icon="hard-drive">
+    Stores and retrieves data blocks on behalf of HDFS clients and the NameNode. Runs on every worker node.
+  </Card>
+  <Card title="ResourceManager" icon="cpu">
+    Accepts job submissions from clients and allocates cluster resources to applications via YARN.
+  </Card>
+  <Card title="NodeManager" icon="activity">
+    Manages resources and containers on a single worker node. Reports health and utilisation to the ResourceManager.
+  </Card>
+</CardGroup>
+
+## Setup steps
+
+<Steps>
+  <Step title="Configure /etc/hosts on all nodes">
+    Add entries for every node in the cluster so that hostnames resolve without DNS. Apply this to every node.
+
+    ```text
+    # /etc/hosts
+    192.168.1.10  master
+    192.168.1.11  worker1
+    192.168.1.12  worker2
+    192.168.1.13  worker3
+    ```
+
+    <Note>
+      Using IP addresses directly in Hadoop configuration is discouraged. Use hostnames, and ensure they resolve consistently on all nodes.
+    </Note>
+  </Step>
+
+  <Step title="Configure passwordless SSH">
+    On the master node, generate an SSH key pair and distribute the public key to all worker nodes:
+
+    ```bash
+    ssh-keygen -t rsa -P '' -f ~/.ssh/id_rsa
+    ssh-copy-id hadoop@worker1
+    ssh-copy-id hadoop@worker2
+    ssh-copy-id hadoop@worker3
+    # Also enable passwordless SSH to master itself
+    cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+    ```
+
+    Verify connectivity before proceeding:
+
+    ```bash
+    ssh worker1 hostname
+    ```
+  </Step>
+
+  <Step title="Configure hadoop-env.sh">
+    Set `JAVA_HOME` on all nodes. Because `hadoop-env.sh` is read by every daemon at startup, it must be identical on every node.
+
+    ```bash
+    # etc/hadoop/hadoop-env.sh
+    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    export HADOOP_HOME=/opt/hadoop
+    export HADOOP_LOG_DIR=/var/log/hadoop
+    ```
+  </Step>
+
+  <Step title="Configure core-site.xml">
+    Point all cluster components at the NameNode's RPC address:
+
+    ```xml
+    <!-- etc/hadoop/core-site.xml -->
+    <configuration>
+      <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://master:9000</value>
+      </property>
+      <property>
+        <name>hadoop.tmp.dir</name>
+        <value>/data/hadoop/tmp</value>
+      </property>
+    </configuration>
+    ```
+  </Step>
+
+  <Step title="Configure hdfs-site.xml">
+    Set the replication factor to match the number of DataNodes. Three is the standard value for a production cluster.
+
+    ```xml
+    <!-- etc/hadoop/hdfs-site.xml -->
+    <configuration>
+      <property>
+        <name>dfs.namenode.rpc-address</name>
+        <value>master:9000</value>
+      </property>
+      <property>
+        <name>dfs.namenode.http-address</name>
+        <value>master:9870</value>
+      </property>
+      <property>
+        <name>dfs.replication</name>
+        <value>3</value>
+      </property>
+      <property>
+        <name>dfs.namenode.name.dir</name>
+        <value>/data/hadoop/namenode</value>
+      </property>
+      <property>
+        <name>dfs.datanode.data.dir</name>
+        <value>/data/hadoop/datanode</value>
+      </property>
+    </configuration>
+    ```
+
+    <Note>
+      Create the directories specified by `dfs.namenode.name.dir` and `dfs.datanode.data.dir` on the appropriate nodes before starting HDFS. The `hadoop` user must have write access.
+    </Note>
+  </Step>
+
+  <Step title="Configure mapred-site.xml">
+    ```xml
+    <!-- etc/hadoop/mapred-site.xml -->
+    <configuration>
+      <property>
+        <name>mapreduce.framework.name</name>
+        <value>yarn</value>
+      </property>
+      <property>
+        <name>mapreduce.application.classpath</name>
+        <value>$HADOOP_MAPRED_HOME/share/hadoop/mapreduce/*:$HADOOP_MAPRED_HOME/share/hadoop/mapreduce/lib/*</value>
+      </property>
+    </configuration>
+    ```
+  </Step>
+
+  <Step title="Configure yarn-site.xml">
+    Point all NodeManagers at the ResourceManager's hostname:
+
+    ```xml
+    <!-- etc/hadoop/yarn-site.xml -->
+    <configuration>
+      <property>
+        <name>yarn.resourcemanager.hostname</name>
+        <value>master</value>
+      </property>
+      <property>
+        <name>yarn.resourcemanager.address</name>
+        <value>master:8032</value>
+      </property>
+      <property>
+        <name>yarn.resourcemanager.webapp.address</name>
+        <value>master:8088</value>
+      </property>
+      <property>
+        <name>yarn.nodemanager.aux-services</name>
+        <value>mapreduce_shuffle</value>
+      </property>
+      <property>
+        <name>yarn.nodemanager.env-whitelist</name>
+        <value>JAVA_HOME,HADOOP_COMMON_HOME,HADOOP_HDFS_HOME,HADOOP_CONF_DIR,CLASSPATH_PREPEND_DISTCACHE,HADOOP_YARN_HOME,HADOOP_HOME,PATH,LANG,TZ,HADOOP_MAPRED_HOME</value>
+      </property>
+    </configuration>
+    ```
+  </Step>
+
+  <Step title="Configure the workers file">
+    List every worker node hostname in `etc/hadoop/workers`, one per line. The start and stop scripts iterate over this file when launching daemons via SSH.
+
+    ```text
+    worker1
+    worker2
+    worker3
+    ```
+
+    <Note>
+      The default `workers` file contains `localhost`. Remove that entry when running a real cluster; otherwise the master node will also launch DataNode and NodeManager daemons.
+    </Note>
+  </Step>
+
+  <Step title="Distribute configuration to all nodes">
+    Copy the entire `etc/hadoop/` directory to every node in the cluster. Use `scp` or a configuration management tool such as Ansible:
+
+    ```bash
+    for node in worker1 worker2 worker3; do
+      scp -r /opt/hadoop/etc/hadoop/ hadoop@$node:/opt/hadoop/etc/
+    done
+    ```
+  </Step>
+
+  <Step title="Format the NameNode">
+    Run the format command once on the master node only:
+
+    ```bash
+    bin/hdfs namenode -format
+    ```
+
+    <Warning>
+      Formatting erases all HDFS metadata. Only run this command before the cluster has any data, or when you intentionally want to reset the filesystem.
+    </Warning>
+  </Step>
+
+  <Step title="Start the cluster">
+    Start HDFS first, then YARN. The scripts SSH into each worker node listed in the `workers` file and start the appropriate daemons remotely.
+
+    ```bash
+    sbin/start-dfs.sh
+    sbin/start-yarn.sh
+    ```
+
+    To start daemons individually (useful for troubleshooting):
+
+    ```bash
+    # On master
+    bin/hdfs --daemon start namenode
+    bin/hdfs --daemon start secondarynamenode
+    bin/yarn --daemon start resourcemanager
+
+    # On each worker
+    bin/hdfs --daemon start datanode
+    bin/yarn --daemon start nodemanager
+    ```
+  </Step>
+
+  <Step title="Verify the cluster">
+    Run `jps` on each node to confirm the expected daemons are present:
+
+    ```bash
+    # On master
+    jps
+    # Expected: NameNode, SecondaryNameNode, ResourceManager
+
+    # On each worker
+    ssh worker1 jps
+    # Expected: DataNode, NodeManager
+    ```
+
+    Open the web UIs to inspect cluster health:
+
+    | Service | URL |
+    |---|---|
+    | NameNode | http://master:9870 |
+    | ResourceManager | http://master:8088 |
+    | Individual DataNode | http://worker1:9864 |
+
+    Check that all DataNodes appear as live nodes in the NameNode UI before submitting any jobs.
+  </Step>
+</Steps>
+
+## Stopping the cluster
+
+```bash
+sbin/stop-yarn.sh
+sbin/stop-dfs.sh
+```
+
+<Note>
+  For high availability configuration (standby NameNode, ZKFC, JournalNodes), refer to the official HDFS High Availability documentation. For a single-machine setup, see the [single-node guide](/installation/single-node).
+</Note>

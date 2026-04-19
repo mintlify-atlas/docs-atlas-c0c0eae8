@@ -1,0 +1,234 @@
+---
+title: 'YARN Capacity Scheduler: queues, ACLs, and preemption'
+description: 'Configure YARN Capacity Scheduler queues with hierarchical capacity guarantees, access controls, preemption, and automatic queue mapping rules.'
+---
+
+The Capacity Scheduler is YARN's default multi-tenant scheduler. It partitions cluster resources into a hierarchy of queues, each with a guaranteed capacity percentage and a configurable maximum. Teams or workloads are assigned to queues; the scheduler ensures that each queue receives at least its allocated share of the cluster even under heavy contention. When a queue is idle, its unused capacity can be borrowed by other queues up to a defined ceiling, which keeps overall cluster utilization high. The Capacity Scheduler is configured entirely through `capacity-scheduler.xml` and requires no code changes to deploy.
+
+## Queue hierarchy
+
+Every configuration starts from the `root` queue, which represents 100% of cluster capacity. Child queues are defined recursively; each child is given a `capacity` value that is a percentage of its parent's capacity. The percentages of all siblings under the same parent must sum to 100.
+
+```
+root (100%)
+├── engineering  (60%)
+│   ├── batch    (40% of engineering = 24% of cluster)
+│   └── interactive (60% of engineering = 36% of cluster)
+└── marketing    (40%)
+```
+
+<Note>
+  Leaf queues are the only queues that accept application submissions. Parent queues like `root` and `engineering` exist solely to group and aggregate their children.
+</Note>
+
+## Key properties per queue
+
+Each queue is identified by a dot-separated path prefixed with `yarn.scheduler.capacity`. For example, the `engineering` queue under `root` uses the prefix `yarn.scheduler.capacity.root.engineering`.
+
+| Property suffix | Type | Description |
+|---|---|---|
+| `capacity` | float (%) | Guaranteed share of the parent queue's resources |
+| `maximum-capacity` | float (%) | Hard upper limit; the queue cannot use more than this even if the cluster is otherwise idle. `-1` means no limit |
+| `minimum-user-limit-percent` | int (%) | Minimum percentage of the queue's capacity available to each active user. Prevents a single user from monopolizing a shared queue |
+| `user-limit-factor` | float | Multiplier on `minimum-user-limit-percent`. A value of `2` lets a single user consume up to twice their minimum share if capacity is available |
+| `maximum-applications` | int | Maximum concurrent applications in the queue |
+| `state` | `RUNNING` / `STOPPED` | A `STOPPED` queue rejects new submissions but lets existing applications finish |
+
+## Two-queue example: engineering and marketing
+
+The following `capacity-scheduler.xml` implements the `root → engineering + marketing` topology shown above, with an additional `interactive` child under `engineering`.
+
+```xml capacity-scheduler.xml
+<configuration>
+  <!-- Root-level settings -->
+  <property>
+    <name>yarn.scheduler.capacity.root.queues</name>
+    <value>engineering,marketing</value>
+  </property>
+
+  <!-- engineering queue -->
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.capacity</name>
+    <value>60</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.maximum-capacity</name>
+    <value>80</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.queues</name>
+    <value>batch,interactive</value>
+  </property>
+
+  <!-- engineering.batch -->
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.batch.capacity</name>
+    <value>40</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.batch.maximum-capacity</name>
+    <value>100</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.batch.minimum-user-limit-percent</name>
+    <value>25</value>
+  </property>
+
+  <!-- engineering.interactive -->
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.interactive.capacity</name>
+    <value>60</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.interactive.maximum-capacity</name>
+    <value>100</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.capacity.root.engineering.interactive.minimum-user-limit-percent</name>
+    <value>50</value>
+  </property>
+
+  <!-- marketing queue -->
+  <property>
+    <name>yarn.scheduler.capacity.root.marketing.capacity</name>
+    <value>40</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.capacity.root.marketing.maximum-capacity</name>
+    <value>60</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.capacity.root.marketing.minimum-user-limit-percent</name>
+    <value>33</value>
+  </property>
+</configuration>
+```
+
+## Absolute vs relative capacity
+
+By default, `capacity` values are percentages relative to the parent queue. Alternatively, you can express capacity as an absolute resource amount:
+
+```xml capacity-scheduler.xml — absolute capacity
+<property>
+  <name>yarn.scheduler.capacity.root.engineering.capacity</name>
+  <value>[memory=30720,vcores=24]</value>
+</property>
+```
+
+Absolute capacity is useful when you want to guarantee a fixed amount of hardware rather than a percentage that shifts as the cluster grows or shrinks.
+
+## Access control
+
+Each queue supports two ACL properties that control who can submit applications and who can administer (kill applications, change queue state) the queue.
+
+```xml capacity-scheduler.xml — ACLs
+<!-- Anyone in the eng-users group can submit to engineering.batch -->
+<property>
+  <name>yarn.scheduler.capacity.root.engineering.batch.acl_submit_applications</name>
+  <value> eng-users</value>
+</property>
+
+<!-- Only yarn-admins can administer the marketing queue -->
+<property>
+  <name>yarn.scheduler.capacity.root.marketing.acl_administer_queue</name>
+  <value> yarn-admins</value>
+</property>
+```
+
+<Note>
+  The ACL value format is `users groups`. A leading space (as in ` eng-users`) means no individual users, only the listed group. Use `*` to permit everyone, or a single space ` ` to deny all access.
+</Note>
+
+## Preemption
+
+Preemption allows the ResourceManager to reclaim containers from queues that are over their guaranteed capacity and reallocate them to under-served queues.
+
+```xml capacity-scheduler.xml — per-queue preemption
+<property>
+  <name>yarn.scheduler.capacity.root.engineering.disable_preemption</name>
+  <value>false</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.root.marketing.disable_preemption</name>
+  <value>true</value>
+</property>
+```
+
+Enable cluster-wide preemption in `yarn-site.xml`:
+
+```xml yarn-site.xml
+<property>
+  <name>yarn.resourcemanager.monitor.capacity.preemption.enabled</name>
+  <value>true</value>
+</property>
+<property>
+  <name>yarn.resourcemanager.monitor.capacity.preemption.max_wait_before_kill</name>
+  <value>15000</value>
+</property>
+```
+
+<Warning>
+  Preemption kills running containers. Applications that do not checkpoint their state will need to recompute the lost work. Verify your workloads can tolerate container loss before enabling preemption on a production queue.
+</Warning>
+
+## Queue mapping
+
+Queue mapping rules automatically route submitted applications to the correct queue based on the submitting user or their Unix group, without requiring the application to specify a queue explicitly.
+
+```xml capacity-scheduler.xml — queue mapping rules
+<property>
+  <name>yarn.scheduler.capacity.queue-mappings</name>
+  <value>u:alice:engineering.interactive,g:data-eng:engineering.batch,u:%user:marketing</value>
+</property>
+<property>
+  <name>yarn.scheduler.capacity.queue-mappings-override.enable</name>
+  <value>true</value>
+</property>
+```
+
+Mapping rule format:
+
+| Token | Meaning |
+|---|---|
+| `u:username:queue` | Route submissions from a specific user to the named queue |
+| `g:groupname:queue` | Route submissions from any member of the group to the named queue |
+| `u:%user:queue` | Route each user to a queue matching their username (useful with auto-created queues) |
+
+Rules are evaluated left to right; the first match wins. Setting `queue-mappings-override.enable` to `true` ignores any queue specified by the application itself.
+
+## Reloading configuration without restart
+
+You can refresh queue configuration at runtime without restarting the ResourceManager:
+
+```bash
+yarn rmadmin -refreshQueues
+```
+
+<Tip>
+  Use `yarn rmadmin -refreshQueues` after every change to `capacity-scheduler.xml`. The command is safe to run on a live cluster and takes effect within seconds. New queues become active immediately; existing queues apply updated capacity values at the next scheduling cycle.
+</Tip>
+
+## Global capacity scheduler settings
+
+```xml capacity-scheduler.xml — global defaults
+<configuration>
+  <!-- Maximum applications across the entire cluster -->
+  <property>
+    <name>yarn.scheduler.capacity.maximum-applications</name>
+    <value>10000</value>
+  </property>
+
+  <!-- Maximum fraction of cluster resources used by ApplicationMasters -->
+  <property>
+    <name>yarn.scheduler.capacity.maximum-am-resource-percent</name>
+    <value>0.1</value>
+  </property>
+
+  <!-- Resource calculator: DefaultResourceCalculator (memory only)
+       or DominantResourceCalculator (memory + CPU) -->
+  <property>
+    <name>yarn.scheduler.capacity.resource-calculator</name>
+    <value>org.apache.hadoop.yarn.util.resource.DefaultResourceCalculator</value>
+  </property>
+</configuration>
+```

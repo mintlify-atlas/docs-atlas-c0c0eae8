@@ -1,0 +1,326 @@
+---
+title: "HDFS administration: dfsadmin, quotas, and snapshots"
+description: "Administer HDFS with dfsadmin commands, safe mode control, block integrity checks, quota management, snapshots, and DataNode balancing."
+---
+
+The `hdfs dfsadmin` command is the primary tool for managing the Hadoop Distributed File System. It communicates directly with the NameNode and, where needed, individual DataNodes to perform operations ranging from routine health checks to reconfiguring the cluster topology. Most `dfsadmin` subcommands require the caller to be an HDFS superuser (`dfs.cluster.administrators`).
+
+## dfsadmin command reference
+
+### Cluster report
+
+```bash
+# Full report: storage capacity, block counts, live and dead DataNodes
+hdfs dfsadmin -report
+
+# Filter by node state
+hdfs dfsadmin -report -live
+hdfs dfsadmin -report -dead
+hdfs dfsadmin -report -decommissioning
+hdfs dfsadmin -report -enteringmaintenance
+hdfs dfsadmin -report -slownodes
+```
+
+### Refreshing cluster membership
+
+```bash
+# Tell the NameNode to re-read dfs.hosts and dfs.hosts.exclude
+hdfs dfsadmin -refreshNodes
+```
+
+Use this after modifying the include or exclude host files to add or remove DataNodes without restarting the NameNode.
+
+### Service ACL refresh
+
+```bash
+# Reload hadoop-policy.xml without restarting the NameNode
+hdfs dfsadmin -refreshServiceAcl
+```
+
+### User-to-group mappings refresh
+
+```bash
+hdfs dfsadmin -refreshUserToGroupsMappings
+```
+
+### Metadata save
+
+```bash
+# Force the NameNode to write a checkpoint of its namespace to disk
+hdfs dfsadmin -saveNamespace
+
+# Save and then prepare for shutdown (useful before planned maintenance)
+hdfs dfsadmin -saveNamespace -beforeShutdown
+```
+
+## Safe mode
+
+Safe mode is a read-only state the NameNode enters at startup—and can be manually forced—during which no file-system modifications are permitted. The NameNode exits safe mode automatically once enough DataNodes have registered and reported their blocks.
+
+```bash
+# Check whether the NameNode is in safe mode
+hdfs dfsadmin -safemode get
+
+# Force the NameNode into safe mode
+hdfs dfsadmin -safemode enter
+
+# Release safe mode
+hdfs dfsadmin -safemode leave
+
+# Block the calling process until safe mode exits
+hdfs dfsadmin -safemode wait
+
+# Override safe mode without waiting for block reports (emergency use only)
+hdfs dfsadmin -safemode forceExit
+```
+
+<Warning>
+`-safemode forceExit` bypasses block report thresholds. Only use it when you are certain no data has been lost and the cluster is fully operational.
+</Warning>
+
+The key configuration properties that control automatic safe mode exit are:
+
+```xml
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.namenode.safemode.threshold-pct</name>
+  <value>0.999</value>
+  <description>
+    Fraction of blocks that must be considered complete before
+    the NameNode exits safe mode automatically.
+  </description>
+</property>
+<property>
+  <name>dfs.namenode.safemode.min.datanodes</name>
+  <value>0</value>
+  <description>
+    Minimum number of live DataNodes required before safe mode
+    can be exited. 0 means no minimum is enforced.
+  </description>
+</property>
+```
+
+## Block reports and data integrity
+
+`hdfs fsck` scans the namespace tree and cross-references it with block metadata held by the NameNode to detect inconsistencies.
+
+```bash
+# Check the entire filesystem
+hdfs fsck /
+
+# Verbose output: list each file with its blocks and locations
+hdfs fsck /user/hadoop -files -blocks -locations
+
+# Report only corrupt or missing files
+hdfs fsck / -list-corruptfileblocks
+
+# Attempt to move corrupt files to /lost+found
+hdfs fsck / -move
+
+# Delete files that cannot be recovered
+hdfs fsck / -delete
+```
+
+<Note>
+`hdfs fsck` is a read-only diagnostic by default. The `-move` and `-delete` flags modify data; use them only after reviewing the output carefully.
+</Note>
+
+## Balancer
+
+Over time, as DataNodes are added or removed and data is written unevenly, some DataNodes accumulate more blocks than others. The HDFS Balancer redistributes blocks across DataNodes to equalize utilization.
+
+```bash
+# Start the balancer with default threshold (10%)
+hdfs balancer
+
+# Use a tighter threshold (5% maximum deviation)
+hdfs balancer -threshold 5
+
+# Limit bandwidth used per DataNode during balancing
+hdfs dfsadmin -setBalancerBandwidth 104857600   # 100 MB/s
+
+# Check the current bandwidth setting on a specific DataNode
+hdfs dfsadmin -getBalancerBandwidth <datanode-host>:<ipc-port>
+```
+
+<Tip>
+Run the balancer during off-peak hours. It is designed to run in the background and throttle itself, but large rebalancing jobs can still affect I/O-sensitive workloads.
+</Tip>
+
+The balancer reads its policy from `hdfs-site.xml`:
+
+```xml
+<property>
+  <name>dfs.datanode.balance.bandwidthPerSec</name>
+  <value>10485760</value>
+  <description>Maximum bandwidth (bytes/sec) each DataNode uses for balancing.</description>
+</property>
+```
+
+## Decommissioning DataNodes
+
+Decommissioning copies all blocks from a DataNode to other nodes before the DataNode is shut down, protecting against data loss.
+
+<Steps>
+  <Step title="Configure the exclude file">
+    In `hdfs-site.xml`, set the path to the exclusion file if you have not done so already:
+
+    ```xml
+    <property>
+      <name>dfs.hosts.exclude</name>
+      <value>/etc/hadoop/conf/dfs.hosts.exclude</value>
+    </property>
+    ```
+  </Step>
+  <Step title="Add the DataNode hostname to the exclude file">
+    ```bash
+    echo "datanode-04.example.com" >> /etc/hadoop/conf/dfs.hosts.exclude
+    ```
+  </Step>
+  <Step title="Trigger a node refresh">
+    ```bash
+    hdfs dfsadmin -refreshNodes
+    ```
+    The NameNode immediately starts migrating blocks away from the excluded host.
+  </Step>
+  <Step title="Monitor decommission progress">
+    ```bash
+    hdfs dfsadmin -report -decommissioning
+    ```
+    The node transitions through **Decommission In Progress** → **Decommissioned**. This can take minutes to hours depending on the volume of data to copy.
+  </Step>
+  <Step title="Stop the DataNode and clean up">
+    Once the node shows **Decommissioned**, stop the daemon:
+
+    ```bash
+    $HADOOP_HOME/bin/hdfs --daemon stop datanode
+    ```
+
+    Remove the hostname from `dfs.hosts.exclude` and run `-refreshNodes` again so the NameNode stops tracking the entry.
+  </Step>
+</Steps>
+
+## Disk management on DataNodes
+
+### Adding a new disk
+
+1. Mount the new disk (e.g., `/data/disk2`).
+2. Add the new path to `dfs.datanode.data.dir` in `hdfs-site.xml`:
+
+```xml
+<property>
+  <name>dfs.datanode.data.dir</name>
+  <value>/data/disk1,/data/disk2</value>
+</property>
+```
+
+3. Trigger a live reconfiguration without restarting the DataNode:
+
+```bash
+hdfs dfsadmin -reconfig datanode <datanode-host>:<ipc-port> start
+hdfs dfsadmin -reconfig datanode <datanode-host>:<ipc-port> status
+```
+
+### Removing a failed disk
+
+Remove the path from `dfs.datanode.data.dir` and apply the same reconfiguration steps. The DataNode will stop using that directory and the NameNode will re-replicate any blocks that were stored exclusively on the removed disk.
+
+## Quota management
+
+HDFS supports two independent quota types per directory: namespace quotas (number of names) and storage quotas (total byte usage).
+
+### Namespace quotas
+
+```bash
+# Allow at most 1,000 names (files + directories) under /project/alpha
+hdfs dfsadmin -setQuota 1000 /project/alpha
+
+# Remove the namespace quota
+hdfs dfsadmin -clrQuota /project/alpha
+```
+
+### Storage quotas
+
+```bash
+# Limit /project/alpha to 500 GB
+hdfs dfsadmin -setSpaceQuota 536870912000 /project/alpha
+
+# Limit SSD storage specifically
+hdfs dfsadmin -setSpaceQuota 10737418240 -storageType SSD /project/alpha
+
+# Remove the storage quota
+hdfs dfsadmin -clrSpaceQuota /project/alpha
+
+# Check quota usage for a directory
+hdfs dfs -count -q -h /project/alpha
+```
+
+<Note>
+Storage quotas account for replication. A 1 GB file with a replication factor of 3 consumes 3 GB of quota.
+</Note>
+
+## Snapshot management
+
+HDFS snapshots are point-in-time, read-only copies of a directory. They are space-efficient because only changed blocks are copied on write.
+
+<Steps>
+  <Step title="Enable snapshots on a directory">
+    ```bash
+    hdfs dfsadmin -allowSnapshot /data/warehouse
+    ```
+  </Step>
+  <Step title="Create a snapshot">
+    ```bash
+    # Create with an explicit name
+    hdfs dfs -createSnapshot /data/warehouse 2024-01-15-backup
+
+    # Create with an auto-generated name
+    hdfs dfs -createSnapshot /data/warehouse
+    ```
+  </Step>
+  <Step title="Rename a snapshot">
+    ```bash
+    hdfs dfs -renameSnapshot /data/warehouse 2024-01-15-backup jan15
+    ```
+  </Step>
+  <Step title="List snapshots">
+    ```bash
+    hdfs lsSnapshottableDir
+    hdfs snapshotDiff /data/warehouse jan15 2024-02-01-backup
+    ```
+  </Step>
+  <Step title="Delete a snapshot">
+    ```bash
+    hdfs dfs -deleteSnapshot /data/warehouse jan15
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+You cannot delete a snapshottable directory while it still has snapshots. Delete all snapshots first, then run `hdfs dfsadmin -disallowSnapshot <path>`.
+</Warning>
+
+## Trash configuration
+
+HDFS Trash moves deleted files to a `.Trash` directory under the user's home directory before permanent deletion, providing a recovery window.
+
+```xml
+<!-- core-site.xml -->
+<property>
+  <name>fs.trash.interval</name>
+  <value>1440</value>
+  <description>Time in minutes before files in .Trash are permanently deleted. 0 disables Trash.</description>
+</property>
+<property>
+  <name>fs.trash.checkpoint.interval</name>
+  <value>60</value>
+  <description>How often (minutes) the Trash checkpointer moves files to a timestamped checkpoint directory.</description>
+</property>
+```
+
+To manually empty a user's trash:
+
+```bash
+# Expunge all checkpoint directories immediately
+hdfs dfs -expunge
+```

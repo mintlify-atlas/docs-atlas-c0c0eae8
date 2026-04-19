@@ -1,0 +1,206 @@
+---
+title: "Hadoop configuration: XML files and the Configuration API"
+description: "How Hadoop's XML-based Configuration class works: property precedence, configuration files, typed getters and setters, and variable substitution."
+---
+
+Hadoop uses an XML-based configuration system built around the `Configuration` class (`org.apache.hadoop.conf.Configuration`). Every component — HDFS, MapReduce, YARN, and the common layer — reads its settings from `Configuration` objects at startup. Configuration resources are loaded in a defined order so that site-specific files can override defaults without modifying them. The class is thread-safe for reads after initialization and is used pervasively throughout the codebase: it is passed to `FileSystem.get()`, `Job.getInstance()`, and virtually every other factory method.
+
+## Configuration files
+
+By default, Hadoop loads two resources from the classpath in order:
+
+1. **`core-default.xml`** — read-only defaults bundled inside the Hadoop JAR. Never edit this file.
+2. **`core-site.xml`** — site-specific overrides for a given installation. This is where you set `fs.defaultFS`, security settings, and other cluster-wide properties.
+
+Other subsystems add their own file pairs following the same convention:
+
+| Subsystem | Defaults file | Site file |
+|---|---|---|
+| Common | `core-default.xml` | `core-site.xml` |
+| HDFS | `hdfs-default.xml` | `hdfs-site.xml` |
+| MapReduce | `mapred-default.xml` | `mapred-site.xml` |
+| YARN | `yarn-default.xml` | `yarn-site.xml` |
+
+## Property precedence
+
+Properties are resolved in the following order (highest priority wins):
+
+1. Properties set programmatically via `conf.set(key, value)`
+2. System properties (`-Dkey=value` passed to the JVM)
+3. `core-site.xml` and other site files (loaded last-wins among resources)
+4. `core-default.xml` and other default files
+
+A property declared **final** in an earlier resource cannot be overridden by a later one. For example, if `core-site.xml` marks a property final, a subsequent `conf.set()` call will have no effect at runtime.
+
+<Warning>
+  Properties marked `<final>true</final>` in a configuration file silently ignore any programmatic or subsequent file override. If a setting is not taking effect, check whether it has been declared final upstream.
+</Warning>
+
+## Example core-site.xml
+
+```xml core-site.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+
+  <!-- Default filesystem URI -->
+  <property>
+    <name>fs.defaultFS</name>
+    <value>hdfs://namenode:8020</value>
+    <description>The URI of the default filesystem.</description>
+  </property>
+
+  <!-- I/O buffer size used for HDFS reads and writes -->
+  <property>
+    <name>io.file.buffer.size</name>
+    <value>131072</value>
+  </property>
+
+  <!-- Trash interval in minutes (0 disables trash) -->
+  <property>
+    <name>fs.trash.interval</name>
+    <value>1440</value>
+    <description>Number of minutes between trash checkpoints.</description>
+  </property>
+
+  <!-- Mark a property as final so it cannot be overridden -->
+  <property>
+    <name>hadoop.security.authentication</name>
+    <value>kerberos</value>
+    <final>true</final>
+  </property>
+
+</configuration>
+```
+
+## Getting and setting values
+
+`Configuration` provides typed getters for all primitive types, collections, and classes:
+
+```java
+import org.apache.hadoop.conf.Configuration;
+
+Configuration conf = new Configuration();
+
+// String
+String defaultFS = conf.get("fs.defaultFS");
+String withDefault = conf.get("my.property", "fallback-value");
+
+// Numeric types
+int bufferSize = conf.getInt("io.file.buffer.size", 4096);
+long blockSize = conf.getLong("dfs.blocksize", 128 * 1024 * 1024L);
+float ratio    = conf.getFloat("mapreduce.reduce.shuffle.input.buffer.percent", 0.7f);
+
+// Boolean
+boolean trashEnabled = conf.getBoolean("fs.trash.interval", false);
+
+// Setting values programmatically
+conf.set("my.custom.property", "value");
+conf.setInt("mapreduce.job.reduces", 4);
+
+// Set only if the key has no existing value
+conf.setIfUnset("fs.defaultFS", "file:///");
+
+// Retrieve all properties matching a prefix (returns Map<String,String>)
+conf.getPropsWithPrefix("dfs.").forEach((k, v) ->
+    System.out.println("dfs." + k + " = " + v));
+```
+
+## Loading additional resources
+
+You can add configuration files beyond the standard defaults programmatically:
+
+```java
+// Load from classpath
+conf.addResource("my-site.xml");
+
+// Load from a filesystem Path
+conf.addResource(new Path("/etc/hadoop/custom.xml"));
+
+// Load from an InputStream
+conf.addResource(inputStream);
+```
+
+Resources are loaded lazily on first access. Multiple resources are applied in the order they were added; later resources override earlier ones unless a property is final.
+
+## Variable substitution
+
+Configuration values may reference other properties using `${property.name}` syntax:
+
+```xml
+<property>
+  <name>hadoop.log.dir</name>
+  <value>${hadoop.home.dir}/logs</value>
+</property>
+```
+
+Environment variables are available via `${env.VARIABLE_NAME}`:
+
+```xml
+<property>
+  <name>hadoop.tmp.dir</name>
+  <value>${env.HOME}/hadoop-tmp</value>
+</property>
+```
+
+<Note>
+  Variable substitution is evaluated at read time (when `conf.get()` is called), not at load time. Circular references will throw an `IllegalStateException`.
+</Note>
+
+## Deprecated properties
+
+Many configuration keys were renamed between Hadoop versions to follow the `component.subsystem.property` naming convention. The `Configuration` class maintains a deprecation map: reading or writing an old key transparently maps to the new key and emits a deprecation warning in the logs.
+
+<Tabs>
+  <Tab title="Common deprecated keys">
+    | Deprecated key | Replacement key |
+    |---|---|
+    | `fs.default.name` | `fs.defaultFS` |
+    | `io.bytes.per.checksum` | `dfs.bytes-per-checksum` |
+    | `mapred.job.tracker` | `mapreduce.jobtracker.address` |
+    | `mapred.map.tasks` | `mapreduce.job.maps` |
+    | `mapred.reduce.tasks` | `mapreduce.job.reduces` |
+    | `mapred.child.java.opts` | `mapreduce.map.java.opts` / `mapreduce.reduce.java.opts` |
+    | `dfs.replication` | `dfs.replication` (unchanged, but old form differs by component) |
+  </Tab>
+  <Tab title="Checking for deprecated use">
+    You can inspect all deprecated properties at runtime:
+
+    ```java
+    // Check if a key is deprecated
+    boolean isDeprecated = Configuration.isDeprecated("fs.default.name");
+
+    // Retrieve the replacement keys for a deprecated key
+    String[] replacements = Configuration.getAlternativeNames("fs.default.name");
+    // Returns: ["fs.defaultFS"]
+    ```
+  </Tab>
+</Tabs>
+
+## The Configured base class
+
+Components that need a `Configuration` injected at construction time should extend `org.apache.hadoop.conf.Configured` and implement `org.apache.hadoop.util.Tool`:
+
+```java
+import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
+
+public class MyTool extends Configured implements Tool {
+
+  @Override
+  public int run(String[] args) throws Exception {
+    Configuration conf = getConf(); // injected by ToolRunner
+    String value = conf.get("my.setting", "default");
+    // ... do work ...
+    return 0;
+  }
+
+  public static void main(String[] args) throws Exception {
+    // ToolRunner parses -D, -conf, -fs, -jt flags before calling run()
+    System.exit(ToolRunner.run(new MyTool(), args));
+  }
+}
+```
+
+`ToolRunner.run()` applies standard Hadoop generic options — `-conf <file>` to load an additional configuration resource, `-D key=value` to set a property, and `-fs <uri>` to override `fs.defaultFS` — before delegating to your `run()` method.

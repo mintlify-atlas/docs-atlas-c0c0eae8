@@ -1,0 +1,187 @@
+---
+title: 'YARN Fair Scheduler: pools, weights, and sharing policies'
+description: 'Configure YARN Fair Scheduler pools, weights, min/max shares, scheduling policies, and preemption to equalize resource usage across applications.'
+---
+
+The Fair Scheduler dynamically divides cluster resources among all running applications so that each gets an equal share over time. Unlike the Capacity Scheduler, which enforces hard capacity guarantees defined in advance, the Fair Scheduler adapts continuously: when only one application is running it may use the entire cluster, and as more applications are submitted the scheduler redistributes resources until each receives a proportional share. This approach maximizes utilization for bursty workloads while still allowing administrators to define pools with minimum and maximum resource bounds, relative weights, and scheduling policies per pool. The Fair Scheduler is configured through `yarn-site.xml` (to enable it) and `fair-scheduler.xml` (to define pool structure).
+
+## Enabling the Fair Scheduler
+
+```xml yarn-site.xml
+<configuration>
+  <property>
+    <name>yarn.resourcemanager.scheduler.class</name>
+    <value>org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler</value>
+  </property>
+  <property>
+    <name>yarn.scheduler.fair.allocation.file</name>
+    <value>/etc/hadoop/conf/fair-scheduler.xml</value>
+  </property>
+  <!-- Route each user to a pool named after their username -->
+  <property>
+    <name>yarn.scheduler.fair.user-as-default-queue</name>
+    <value>true</value>
+  </property>
+  <!-- Allow pools not defined in fair-scheduler.xml to be created on demand -->
+  <property>
+    <name>yarn.scheduler.fair.allow-undeclared-pools</name>
+    <value>false</value>
+  </property>
+</configuration>
+```
+
+<Note>
+  Setting `yarn.scheduler.fair.allow-undeclared-pools` to `false` is recommended in production. It prevents typos in queue names from silently creating unmanaged pools.
+</Note>
+
+## Pools and shares
+
+A pool (called a queue in Capacity Scheduler terminology) is the unit of resource governance in the Fair Scheduler. Each pool can define:
+
+- **`minResources`** — the minimum allocation the pool is guaranteed even when the cluster is under contention.
+- **`maxResources`** — a hard cap; the pool will never be granted more than this regardless of demand or available capacity.
+- **`weight`** — a relative multiplier for fair-share calculations. A pool with weight `2.0` receives twice the fair share of a pool with weight `1.0`.
+- **`schedulingPolicy`** — the algorithm used to order applications within the pool.
+
+## fair-scheduler.xml structure
+
+```xml fair-scheduler.xml
+<?xml version="1.0"?>
+<allocations>
+  <!-- Default scheduling policy for all pools unless overridden -->
+  <defaultQueueSchedulingPolicy>fair</defaultQueueSchedulingPolicy>
+
+  <!-- engineering pool: higher weight, minimum resource guarantee -->
+  <queue name="engineering">
+    <minResources>8192 mb, 4 vcores</minResources>
+    <maxResources>40960 mb, 32 vcores</maxResources>
+    <weight>3.0</weight>
+    <schedulingPolicy>fair</schedulingPolicy>
+    <aclSubmitApps>*</aclSubmitApps>
+    <aclAdministerApps>yarn-admins</aclAdministerApps>
+
+    <queue name="batch">
+      <weight>1.0</weight>
+      <schedulingPolicy>fifo</schedulingPolicy>
+    </queue>
+    <queue name="interactive">
+      <minResources>4096 mb, 2 vcores</minResources>
+      <weight>2.0</weight>
+      <schedulingPolicy>fair</schedulingPolicy>
+    </queue>
+  </queue>
+
+  <!-- marketing pool: lower weight -->
+  <queue name="marketing">
+    <minResources>2048 mb, 2 vcores</minResources>
+    <maxResources>20480 mb, 16 vcores</maxResources>
+    <weight>1.0</weight>
+    <schedulingPolicy>fair</schedulingPolicy>
+  </queue>
+
+  <!-- Placement rules: route each user to their named pool -->
+  <queuePlacementPolicy>
+    <rule name="specified" create="false"/>
+    <rule name="user" create="true"/>
+    <rule name="default" queue="marketing"/>
+  </queuePlacementPolicy>
+</allocations>
+```
+
+## Weight-based sharing example
+
+With `engineering` weight `3.0` and `marketing` weight `1.0`, the Fair Scheduler divides the cluster in a 3:1 ratio when both pools have active applications and neither has hit its `maxResources` limit.
+
+| Pool | Weight | Fair share (100-node cluster) |
+|---|---|---|
+| `engineering` | 3.0 | 75 nodes (75%) |
+| `marketing` | 1.0 | 25 nodes (25%) |
+
+If `marketing` has no running applications, the entire cluster is available to `engineering` until a marketing job is submitted—at which point resources are gradually rebalanced.
+
+## Scheduling policies
+
+Each pool selects an ordering policy that controls how applications within the pool compete for resources.
+
+<AccordionGroup>
+  <Accordion title="FairSharePolicy (default)">
+    Divides the pool's resources equally among all active applications using the fair-sharing algorithm. Applications that have received less than their fair share are preferred in the next scheduling pass. This policy provides the most equitable distribution for interactive workloads.
+
+    ```xml
+    <schedulingPolicy>fair</schedulingPolicy>
+    ```
+  </Accordion>
+  <Accordion title="DominantResourceFairnessPolicy (DRF)">
+    Extends fair sharing to multiple resource dimensions (memory and CPU simultaneously). An application's dominant resource is the one where it consumes the largest fraction of the cluster. DRF equalizes dominant resource consumption rather than raw container counts, which is more accurate when workloads have heterogeneous memory-to-CPU ratios.
+
+    ```xml
+    <schedulingPolicy>drf</schedulingPolicy>
+    ```
+  </Accordion>
+  <Accordion title="FifoPolicy">
+    Serves applications in submission order within the pool, identical to the global FIFO scheduler. Useful for batch pools where ordered execution is more important than fairness between concurrent jobs.
+
+    ```xml
+    <schedulingPolicy>fifo</schedulingPolicy>
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Preemption
+
+When a pool is below its `minResources` guarantee and the cluster is fully utilized, the Fair Scheduler can preempt (forcibly kill) containers from pools that are over their fair share. A pool is considered starved if it has been below its minimum share for longer than `yarn.scheduler.fair.preemption.min-share-preemption-timeout` milliseconds.
+
+```xml yarn-site.xml — enable Fair Scheduler preemption
+<configuration>
+  <property>
+    <name>yarn.scheduler.fair.preemption</name>
+    <value>true</value>
+  </property>
+  <!-- Time (ms) a pool must be below minShare before preemption triggers -->
+  <property>
+    <name>yarn.scheduler.fair.preemption.min-share-preemption-timeout</name>
+    <value>60000</value>
+  </property>
+  <!-- Time (ms) a pool must be below half its fair share before preemption triggers -->
+  <property>
+    <name>yarn.scheduler.fair.preemption.fairshare-preemption-timeout</name>
+    <value>120000</value>
+  </property>
+  <!-- Grace period (ms) before a container is forcibly killed -->
+  <property>
+    <name>yarn.scheduler.fair.waitTimeBeforeKill</name>
+    <value>15000</value>
+  </property>
+</configuration>
+```
+
+<Warning>
+  Preempted containers are killed without checkpointing. Applications using frameworks that support container-level recovery (such as Spark with speculation or MapReduce task retry) tolerate preemption; long-running streaming jobs may not. Test preemption behavior with your specific workloads before enabling it in production.
+</Warning>
+
+## Capacity Scheduler vs Fair Scheduler
+
+| Feature | Capacity Scheduler | Fair Scheduler |
+|---|---|---|
+| Configuration file | `capacity-scheduler.xml` | `fair-scheduler.xml` |
+| Resource allocation basis | Guaranteed capacity percentage per queue | Dynamic fair share; equalizes usage over time |
+| Borrowing idle capacity | Yes, up to `maximum-capacity` | Yes, unbounded unless `maxResources` is set |
+| Weight-based sharing | Via `user-limit-factor`; not primary | First-class feature (`weight` per pool) |
+| Preemption trigger | Queue below guaranteed capacity | Pool below `minResources` or half fair share |
+| Best suited for | Predictable multi-team SLA enforcement | Bursty, mixed-priority workloads |
+| Dynamic queue creation | Via auto-queue creation plugin | Automatic when `allow-undeclared-pools=true` |
+| Scheduling policies per queue | FIFO or Fair ordering | FIFO, Fair, DRF (per pool) |
+
+<Tip>
+  Choose the Capacity Scheduler when your organization requires contractual resource guarantees per team. Choose the Fair Scheduler when you want to maximize utilization and treat resource allocation as a best-effort service that adapts to actual demand.
+</Tip>
+
+## Reloading allocation file
+
+The Fair Scheduler polls `fair-scheduler.xml` for changes at the interval configured by `yarn.scheduler.fair.allocation.file-check-interval-ms` (default: 10 seconds). You can also force an immediate reload:
+
+```bash
+yarn rmadmin -refreshQueues
+```
+
+Pool additions and weight changes take effect without restarting the ResourceManager. Removing a pool that has active applications is deferred until those applications complete.

@@ -1,0 +1,97 @@
+{
+  "projectType": "data-platform",
+  "projectName": "Apache Hadoop",
+  "projectDescription": "A distributed computing framework for reliable, scalable, and distributed processing of large datasets across clusters of commodity hardware.",
+  "theme": "aspen",
+  "primaryColor": "#6bbee5",
+  "lightColor": "#0f1b28",
+  "darkColor": "#f5f6f4",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Getting Started",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["introduction", "architecture", "quickstart"]
+          },
+          {
+            "group": "Installation",
+            "pages": ["installation/single-node", "installation/cluster-setup", "installation/building-from-source"]
+          }
+        ]
+      },
+      {
+        "tab": "Core Components",
+        "groups": [
+          {
+            "group": "HDFS",
+            "pages": ["hdfs/overview", "hdfs/architecture", "hdfs/commands", "hdfs/federation"]
+          },
+          {
+            "group": "YARN",
+            "pages": ["yarn/overview", "yarn/resource-management", "yarn/capacity-scheduler", "yarn/fair-scheduler"]
+          },
+          {
+            "group": "MapReduce",
+            "pages": ["mapreduce/overview", "mapreduce/tutorial", "mapreduce/compatibility"]
+          },
+          {
+            "group": "Common",
+            "pages": ["common/filesystem-api", "common/configuration", "common/security"]
+          }
+        ]
+      },
+      {
+        "tab": "Operations & Tools",
+        "groups": [
+          {
+            "group": "Administration",
+            "pages": ["operations/cluster-administration", "operations/hdfs-admin", "operations/yarn-admin"]
+          },
+          {
+            "group": "Security",
+            "pages": ["security/kerberos", "security/transparent-encryption", "security/service-authorization"]
+          },
+          {
+            "group": "Tools",
+            "pages": ["tools/distcp", "tools/streaming", "tools/archives"]
+          },
+          {
+            "group": "Cloud Storage",
+            "pages": ["cloud/aws-s3", "cloud/azure", "cloud/gcs"]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "HDFS: Distributed file system for fault-tolerant, high-throughput data storage",
+    "YARN: Cluster resource management and job scheduling framework",
+    "MapReduce: Parallel data processing framework for large-scale computations",
+    "High Availability: NameNode HA and YARN ResourceManager HA support",
+    "Federation: HDFS namespace federation for horizontal scaling",
+    "Cloud Storage: Native connectors for AWS S3, Azure Data Lake, Google Cloud Storage",
+    "Kerberos Security: Full authentication and authorization support",
+    "Transparent Encryption: HDFS encryption zones for data-at-rest security",
+    "DistCp: Distributed copy tool for large inter/intra-cluster data transfers",
+    "Capacity Scheduler: Multi-tenant resource management with hierarchical queues"
+  ],
+  "publicApiSurface": [
+    "org.apache.hadoop.fs.FileSystem",
+    "org.apache.hadoop.fs.FileContext",
+    "org.apache.hadoop.fs.Path",
+    "org.apache.hadoop.fs.FSDataInputStream",
+    "org.apache.hadoop.fs.FSDataOutputStream",
+    "org.apache.hadoop.conf.Configuration",
+    "org.apache.hadoop.security.UserGroupInformation",
+    "org.apache.hadoop.mapreduce.Job",
+    "org.apache.hadoop.mapreduce.Mapper",
+    "org.apache.hadoop.mapreduce.Reducer",
+    "org.apache.hadoop.yarn.client.api.YarnClient",
+    "org.apache.hadoop.hdfs.DistributedFileSystem",
+    "org.apache.hadoop.tools.DistCp",
+    "hadoop fs <command> (HDFS Shell CLI)",
+    "hadoop jar <jar> <mainClass> (MapReduce job submission)"
+  ]
+}

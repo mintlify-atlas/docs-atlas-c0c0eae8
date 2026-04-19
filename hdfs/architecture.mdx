@@ -1,0 +1,207 @@
+---
+title: 'HDFS architecture: NameNode, DataNodes, and HA'
+description: 'Understand how the NameNode, DataNodes, block replication, and high-availability failover work together inside the Hadoop Distributed File System.'
+---
+
+HDFS follows a primary/worker architecture: a single NameNode manages the file system namespace while many DataNodes handle physical block storage. This separation of concerns lets the NameNode serve metadata requests from fast in-memory structures while DataNodes focus on maximizing I/O throughput to their local disks. Understanding how these components interact—and how the system stays available when nodes fail—is essential for operating HDFS clusters at scale.
+
+## NameNode
+
+The NameNode is the sole authority for the HDFS namespace. It keeps the entire directory tree and all file-to-block mappings in heap memory so that metadata lookups are fast, with no disk I/O in the critical path. Two on-disk structures back this in-memory state:
+
+- **`fsimage`** — a complete, point-in-time snapshot of the namespace written periodically.
+- **Edit log** — a sequential journal of every namespace mutation (create, rename, delete, permission change). The NameNode appends each change to the edit log before acknowledging it to the client.
+
+On startup, the NameNode loads the latest `fsimage` then replays any edit log segments that were written after that snapshot, bringing the in-memory state up to date. The block map (which DataNodes hold each block) is **not** stored persistently; it is rebuilt from block reports sent by DataNodes during startup.
+
+Key classes: `NameNode` ([`NameNode.java`]()), `FSNamesystem` ([`FSNamesystem.java`]()), `FSImage` ([`FSImage.java`]()), `FSEditLog` ([`FSEditLog.java`]()) in `server/namenode/`.
+
+<Warning>
+Because the NameNode holds all metadata in memory, the heap size is a hard limit on the number of files and blocks the cluster can store. A common rule of thumb is roughly 150 bytes of heap per filesystem object (file, directory, or block).
+</Warning>
+
+## DataNode
+
+Each DataNode stores block files on its local disk and participates in two ongoing communication protocols with the NameNode:
+
+- **Heartbeats** (default every 3 seconds, `dfs.heartbeat.interval`) — confirm the DataNode is alive. If the NameNode receives no heartbeat for 10 minutes (configurable via `dfs.namenode.heartbeat.recheck-interval`), it marks the node as dead and schedules re-replication of its blocks.
+- **Block reports** (default every 6 hours, `dfs.blockreport.intervalMsec`) — a complete inventory of all blocks stored locally. The NameNode uses these to maintain and verify its block map.
+
+DataNodes also exchange blocks directly with each other during write pipelines and during re-replication triggered by the NameNode.
+
+Key classes: `DataNode` ([`DataNode.java`]()), `BlockPoolManager` ([`BlockPoolManager.java`]()), `BPOfferService` ([`BPOfferService.java`]()) in `server/datanode/`.
+
+## Block replication and rack awareness
+
+The default replication factor is 3. The block placement policy (`BlockPlacementPolicyDefault`) places replicas as follows:
+
+1. **First replica** — on the node writing the data (or a node in the same rack if the writer is not a DataNode).
+2. **Second replica** — on a DataNode in a **different rack** from the first.
+3. **Third replica** — on a **different DataNode in the same rack** as the second.
+
+This layout means a complete rack failure can destroy at most one of the three replicas. For reads, the client prefers the closest replica (same node, then same rack, then remote rack) to minimize network traffic.
+
+```xml
+<!-- hdfs-site.xml -->
+<property>
+  <name>dfs.replication</name>
+  <value>3</value>
+</property>
+<property>
+  <name>net.topology.script.file.name</name>
+  <value>/etc/hadoop/topology.sh</value>
+</property>
+```
+
+<Tip>
+Setting `dfs.replication` in `hdfs-site.xml` applies a cluster-wide default. Individual files can override the replication factor at creation time using the `-replication` flag of `hadoop fs -put` or programmatically via `DistributedFileSystem.setReplication()`.
+</Tip>
+
+## Read and write paths
+
+<Tabs>
+  <Tab title="Read path">
+    When a client reads a file, it contacts the NameNode once to get block locations, then streams data directly from DataNodes without further NameNode involvement.
+
+    <Steps>
+      <Step title="Open the file">
+        The HDFS client calls `DistributedFileSystem.open()`. The client library sends an RPC to the NameNode requesting block locations for the first batch of blocks.
+      </Step>
+      <Step title="Receive block locations">
+        The NameNode returns a list of `LocatedBlock` objects—each block's ID, length, and the set of DataNodes holding replicas, sorted by proximity to the client.
+      </Step>
+      <Step title="Connect to the closest DataNode">
+        The client opens a TCP connection to the first (closest) DataNode for each block and reads the block data in a streaming fashion via the `DataTransferProtocol`.
+      </Step>
+      <Step title="Handle failures transparently">
+        If a DataNode fails mid-read, the client automatically retries with the next replica in the list. Corrupt blocks are detected via checksums; the client reports the corruption to the NameNode and fetches a clean replica.
+      </Step>
+      <Step title="Fetch subsequent blocks">
+        As the read advances, the client pre-fetches block locations from the NameNode for upcoming blocks, pipelining metadata and data I/O.
+      </Step>
+    </Steps>
+
+    ```java
+    // Simplified read using the FileSystem API
+    FileSystem fs = FileSystem.get(conf);
+    FSDataInputStream in = fs.open(new Path("/user/data/file.parquet"));
+    byte[] buffer = new byte[4096];
+    int bytesRead;
+    while ((bytesRead = in.read(buffer)) > 0) {
+        process(buffer, bytesRead);
+    }
+    in.close();
+    ```
+  </Tab>
+  <Tab title="Write path">
+    Writes use a **pipeline** of DataNodes so that data is replicated in a single pass. The client only needs to push data to the first DataNode; each DataNode in the pipeline forwards data to the next.
+
+    <Steps>
+      <Step title="Create the file">
+        The client calls `DistributedFileSystem.create()`. The NameNode creates a new inode in the namespace and records the file as under construction. The NameNode allocates the first block and selects a pipeline of DataNodes (one per replica).
+      </Step>
+      <Step title="Set up the pipeline">
+        The client connects to the first DataNode. That DataNode connects to the second, which connects to the third. Each DataNode sends an acknowledgment back up the chain once the pipeline is established.
+      </Step>
+      <Step title="Stream data packets">
+        The client sends data in small packets (default 64 KB, `dfs.client-write-packet-size`). Each DataNode writes the packet to its local disk and forwards it to the next DataNode in the pipeline. Acknowledgments travel back up the pipeline to the client.
+      </Step>
+      <Step title="Close the block">
+        When the block is full (or the file is closed), the client tells the NameNode the block is complete. The NameNode updates its block map with the finalized block locations.
+      </Step>
+      <Step title="Handle pipeline failures">
+        If a DataNode in the pipeline fails, the client reconstructs the pipeline with the remaining healthy nodes and the NameNode schedules re-replication to restore the desired replication factor.
+      </Step>
+    </Steps>
+
+    ```java
+    // Simplified write using the FileSystem API
+    FileSystem fs = FileSystem.get(conf);
+    FSDataOutputStream out = fs.create(new Path("/user/data/output.txt"));
+    out.write("hello HDFS\n".getBytes(StandardCharsets.UTF_8));
+    out.close(); // triggers pipeline close and NameNode finalization
+    ```
+  </Tab>
+  <Tab title="High availability">
+    In a non-HA cluster, the NameNode is a single point of failure. HDFS High Availability introduces an **Active/Standby** NameNode pair that eliminates planned and unplanned downtime.
+
+    ### Shared edit log via JournalNodes
+
+    Both NameNodes must see the same sequence of namespace mutations. Rather than writing the edit log to a shared NFS mount (which itself can be a bottleneck), the recommended approach uses a quorum of **JournalNodes**:
+
+    - The Active NameNode writes each edit log entry to a majority quorum of JournalNodes before acknowledging it to the client.
+    - The Standby NameNode continuously tails the JournalNode quorum (via `EditLogTailer`, `EditLogTailer.java`) and applies edits to its own in-memory state, keeping it nearly synchronized.
+    - DataNodes send block reports and heartbeats to **both** NameNodes simultaneously so the Standby always has an up-to-date block map.
+
+    A minimum of 3 JournalNodes is recommended (tolerates 1 failure). Use an odd number to maintain a majority quorum.
+
+    ### Automatic failover with ZooKeeper
+
+    The `DFSZKFailoverController` (ZKFC) runs as a sidecar process on each NameNode host. It:
+
+    1. Monitors the local NameNode's health via periodic health checks.
+    2. Maintains a ZooKeeper lock: whichever ZKFC holds the lock has the Active NameNode.
+    3. On detecting an Active NameNode failure, fences the old Active (via SSH commands or a custom fencer) and promotes the Standby.
+
+    ```xml
+    <!-- hdfs-site.xml — minimal HA configuration -->
+    <property>
+      <name>dfs.nameservices</name>
+      <value>mycluster</value>
+    </property>
+    <property>
+      <name>dfs.ha.namenodes.mycluster</name>
+      <value>nn1,nn2</value>
+    </property>
+    <property>
+      <name>dfs.namenode.rpc-address.mycluster.nn1</name>
+      <value>namenode1.example.com:8020</value>
+    </property>
+    <property>
+      <name>dfs.namenode.rpc-address.mycluster.nn2</name>
+      <value>namenode2.example.com:8020</value>
+    </property>
+    <property>
+      <name>dfs.namenode.shared.edits.dir</name>
+      <value>qjournal://jn1.example.com:8485;jn2.example.com:8485;jn3.example.com:8485/mycluster</value>
+    </property>
+    <property>
+      <name>dfs.ha.automatic-failover.enabled</name>
+      <value>true</value>
+    </property>
+    <property>
+      <name>ha.zookeeper.quorum</name>
+      <value>zk1.example.com:2181,zk2.example.com:2181,zk3.example.com:2181</value>
+    </property>
+    ```
+
+    <Note>
+    The **Secondary NameNode** (class `SecondaryNameNode`) is a separate process that periodically merges the edit log into a new `fsimage` checkpoint to prevent the edit log from growing unboundedly. It is **not** a hot standby—it cannot take over if the primary NameNode fails. In HA deployments the Standby NameNode performs checkpointing via `StandbyCheckpointer` and the Secondary NameNode is not used.
+    </Note>
+
+    ### Failover process
+
+    <Steps>
+      <Step title="Failure detected">
+        The ZKFC on the Active node's host loses its ZooKeeper session (either because the NameNode process died or because the ZKFC's health check fails).
+      </Step>
+      <Step title="Fencing">
+        The ZKFC on the Standby node acquires the ZooKeeper lock, then fences the old Active to guarantee it cannot write any more edits (preventing split-brain).
+      </Step>
+      <Step title="Promotion">
+        The Standby NameNode is promoted to Active. It drains any remaining edits from the JournalNodes and begins accepting client requests. The entire process typically completes in under 30 seconds.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Component summary
+
+| Component | Role | Stores |
+|---|---|---|
+| NameNode | Metadata authority | Namespace (in memory), fsimage + edit log (on disk) |
+| Standby NameNode | Hot standby, checkpointing | Same as NameNode (kept in sync via JournalNodes) |
+| Secondary NameNode | Periodic checkpointing only | Merged fsimage checkpoints |
+| DataNode | Block storage | Raw block files on local disk |
+| JournalNode | Shared edit log quorum | Edit log segments |
+| ZooKeeper | Distributed coordination | NameNode lock for automatic failover |

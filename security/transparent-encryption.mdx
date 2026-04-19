@@ -1,0 +1,245 @@
+---
+title: "HDFS transparent encryption with Hadoop KMS"
+description: "Set up HDFS encryption zones backed by Hadoop KMS. Covers key creation, zone management, key rotation, and interaction with Trash and Erasure Coding."
+---
+
+HDFS transparent encryption allows data to be encrypted on disk while remaining fully accessible to authorized clients without any changes to existing applications. Encryption and decryption happen inside the HDFS client library: the client fetches a decrypted data encryption key (DEK) from the Key Management Server (KMS), uses it to encrypt or decrypt data locally, and stores only the encrypted bytes on DataNodes. The NameNode and DataNodes never see plaintext data or unencrypted key material.
+
+## Architecture overview
+
+The encryption subsystem has three components working together:
+
+- **Hadoop KMS**: A REST-based key server that stores and manages encryption keys. It enforces access control over key operations.
+- **Encryption zones**: HDFS directories marked with a named encryption key. Every file written into an encryption zone is automatically encrypted with a unique per-file DEK derived from the zone key.
+- **HDFS client**: Transparently encrypts writes and decrypts reads by fetching DEKs from the KMS when the user has permission.
+
+<Note>
+Encryption zones are transparent to Hadoop applications. `hdfs dfs -cat`, MapReduce jobs, Spark, and Hive all read and write encrypted files without modification.
+</Note>
+
+## Setting up the Hadoop KMS
+
+### Building and deploying
+
+The KMS ships as a standalone web application inside the Hadoop distribution. Its source lives in `hadoop-common-project/hadoop-kms`. Start it with:
+
+```bash
+$HADOOP_HOME/bin/hdfs --daemon start kms
+```
+
+By default the KMS listens on port **9600** (configured by `hadoop.kms.http.port` in `kms-site.xml`).
+
+### KMS configuration
+
+```xml
+<!-- kms-site.xml -->
+<configuration>
+  <!-- URI of the backing key provider (JavaKeyStoreProvider stores keys on disk) -->
+  <property>
+    <name>hadoop.kms.key.provider.uri</name>
+    <value>jceks://file@/etc/hadoop/kms.keystore</value>
+  </property>
+
+  <!-- KMS port -->
+  <property>
+    <name>hadoop.kms.http.port</name>
+    <value>9600</value>
+  </property>
+
+  <!-- Enable key caching (reduces KMS load; 10-minute default) -->
+  <property>
+    <name>hadoop.kms.cache.enable</name>
+    <value>true</value>
+  </property>
+</configuration>
+```
+
+### Pointing Hadoop at the KMS
+
+Add the KMS URI to `core-site.xml` on every cluster node and client machine:
+
+```xml
+<!-- core-site.xml -->
+<property>
+  <name>hadoop.security.key.provider.path</name>
+  <value>kms://http@kms-host.example.com:9600/kms</value>
+</property>
+```
+
+For a KMS with TLS enabled:
+
+```xml
+<property>
+  <name>hadoop.security.key.provider.path</name>
+  <value>kms://https@kms-host.example.com:9600/kms</value>
+</property>
+```
+
+### KMS ACLs
+
+Access control for key operations is configured in `kms-acls.xml`:
+
+```xml
+<!-- kms-acls.xml -->
+<configuration>
+  <!-- Who can create new keys (default: only the KMS admin) -->
+  <property>
+    <name>hadoop.kms.acl.CREATE</name>
+    <value>hdfs</value>
+  </property>
+
+  <!-- Who can generate DEKs for encryption (needed by HDFS clients) -->
+  <property>
+    <name>hadoop.kms.acl.GENERATE_EEK</name>
+    <value>hdfs</value>
+  </property>
+
+  <!-- Who can decrypt DEKs (needed by HDFS clients reading encrypted files) -->
+  <property>
+    <name>hadoop.kms.acl.DECRYPT_EEK</name>
+    <value>*</value>
+  </property>
+
+  <!-- Per-key ACL: only data-engineers can decrypt with the "finance-key" -->
+  <property>
+    <name>key.acl.finance-key.DECRYPT_EEK</name>
+    <value>data-engineers</value>
+  </property>
+</configuration>
+```
+
+## Creating and managing encryption zones
+
+<Steps>
+  <Step title="Create an encryption key in the KMS">
+    ```bash
+    # Create a 256-bit AES key named "my-encryption-key"
+    hadoop key create my-encryption-key
+
+    # Create with an explicit cipher and length
+    hadoop key create my-encryption-key \
+      -cipher AES/CTR/NoPadding \
+      -size 256
+
+    # List existing keys
+    hadoop key list
+
+    # Inspect key metadata
+    hadoop key list -metadata
+    ```
+  </Step>
+  <Step title="Create an empty HDFS directory">
+    An encryption zone must be created on an existing, empty directory. Files inside cannot be moved to a non-encrypted path.
+
+    ```bash
+    hdfs dfs -mkdir /secure/finance
+    ```
+  </Step>
+  <Step title="Mark the directory as an encryption zone">
+    ```bash
+    hdfs crypto -createZone -keyName my-encryption-key -path /secure/finance
+    ```
+
+    The `CryptoAdmin.CreateZoneCommand` in `CryptoAdmin.java` issues this request to the NameNode via `HdfsAdmin.createEncryptionZone`. A `.Trash` directory is automatically provisioned inside the zone.
+  </Step>
+  <Step title="Verify the zone was created">
+    ```bash
+    # List all encryption zones
+    hdfs crypto -listZones
+
+    # Check encryption info for a specific file inside the zone
+    hdfs crypto -getFileEncryptionInfo -path /secure/finance/report.csv
+    ```
+  </Step>
+</Steps>
+
+## Reading and writing encrypted files
+
+Encryption and decryption are completely transparent to the client. Once the zone exists, all standard HDFS operations work without change:
+
+```bash
+# Write an encrypted file (encryption happens automatically)
+hdfs dfs -put local-report.csv /secure/finance/report.csv
+
+# Read an encrypted file (decryption happens automatically)
+hdfs dfs -cat /secure/finance/report.csv
+
+# A client without KMS DECRYPT_EEK permission will receive an authorization error
+```
+
+The HDFS client in `DFSClient` automatically:
+1. Detects that the destination path is in an encryption zone.
+2. Contacts the KMS to generate an encrypted DEK.
+3. Sends the encrypted DEK to the NameNode (stored in file metadata).
+4. Encrypts data locally before sending blocks to DataNodes.
+
+## Key rotation
+
+Key rotation replaces the zone's active key version. Existing files are re-encrypted (re-keyed) in the background during a `reencryptZone` operation; the zone remains fully accessible during re-encryption.
+
+```bash
+# Roll the key to a new version
+hadoop key roll my-encryption-key
+
+# Trigger re-encryption of all files in the zone with the new key version
+hdfs crypto -reencryptZone -start -path /secure/finance
+
+# Check re-encryption status
+hdfs crypto -listReencryptionStatus
+```
+
+<Warning>
+Re-encryption is CPU-intensive and contacts the KMS for every file in the zone. Schedule it during off-peak hours for large zones and monitor the NameNode's request rate to the KMS.
+</Warning>
+
+```bash
+# Cancel a running re-encryption job
+hdfs crypto -reencryptZone -cancel -path /secure/finance
+```
+
+## Trash and encryption zones
+
+Because encrypted files cannot be decrypted by processes that lack KMS credentials, the standard HDFS Trash directory (`/user/<username>/.Trash`) outside the zone cannot hold deleted encrypted files. Hadoop handles this automatically by provisioning a per-zone trash directory at `<zone-root>/.Trash`.
+
+When you delete a file in an encryption zone, it moves to `<zone-root>/.Trash/<username>/` instead of the user's global Trash. You can also provision this directory explicitly:
+
+```bash
+hdfs crypto -provisionTrash -path /secure/finance
+```
+
+<Note>
+If you move files between encryption zones that use different keys, the data must be re-encrypted. Cross-zone moves are not supported by `hdfs dfs -mv`; you must copy and delete instead.
+</Note>
+
+## Erasure Coding and encryption
+
+HDFS Erasure Coding (EC) and encryption zones are compatible. You can create an encryption zone on a directory that also has an EC policy applied:
+
+```bash
+# Apply an EC policy first
+hdfs ec -setPolicy -policy RS-6-3-1024k -path /secure/ec-data
+
+# Then create the encryption zone
+hdfs crypto -createZone -keyName my-encryption-key -path /secure/ec-data
+```
+
+Encryption operates at the block level, below the EC layer. The HDFS client encrypts each logical block before splitting it into EC data and parity shards. DataNodes store only encrypted shards and have no access to the encryption keys.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="KMS is unreachable">
+    - Verify the KMS process is running: `jps` on the KMS host should show `KMSWebServer`.
+    - Test the KMS REST endpoint: `curl http://kms-host.example.com:9600/kms/v1/keys/names`.
+    - Check `hadoop.security.key.provider.path` in `core-site.xml` for typos.
+  </Accordion>
+  <Accordion title="Permission denied fetching DEK">
+    The user or the `hdfs` service principal lacks `DECRYPT_EEK` permission in `kms-acls.xml`. Check the KMS audit log (`$HADOOP_LOG_DIR/kms-audit.log`) for the specific denied principal and update the relevant ACL entry.
+  </Accordion>
+  <Accordion title="Cannot create encryption zone: directory is not empty">
+    `hdfs crypto -createZone` requires the target directory to be completely empty. Move or delete all files in the directory first, or choose a new empty directory.
+  </Accordion>
+  <Accordion title="Re-encryption is stuck">
+    Check the NameNode log for errors contacting the KMS, and confirm the KMS has enough capacity to handle the additional EEK generation requests. Use `hdfs crypto -listReencryptionStatus` to see the current state and any error messages.
+  </Accordion>
+</AccordionGroup>
